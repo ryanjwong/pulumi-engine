@@ -1,0 +1,24 @@
+# build outputs
+/build/
+/dist/
+*.dylib
+*.so
+*.h
+!capi/libpulumi.h.in
+/capi/libpulumi.h
+
+# node
+node_modules/
+bindings/nodejs/dist/
+bindings/nodejs/lib/native/*.dylib
+bindings/nodejs/lib/native/*.so
+bindings/nodejs/*.tgz
+
+# local state from tests
+/.pulumi-state/
+*.log
+
+# editors
+.idea/
+.vscode/
+.DS_Store
