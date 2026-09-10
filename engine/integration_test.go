@@ -647,7 +647,7 @@ func echoProgram(name, nonce string) Program {
 	return GoProgram(func(ctx *pulumi.Context) error {
 		var r struct {
 			pulumi.CustomResourceState
-			Value pulumi.StringOutput `pulumi:"value"`
+			Value pulumi.StringOutput  `pulumi:"value"`
 			Pid   pulumi.Float64Output `pulumi:"pid"`
 		}
 		inputs := pulumi.Map{"name": pulumi.String(name), "nonce": pulumi.String(nonce)}
