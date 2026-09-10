@@ -1,0 +1,10 @@
+name: engine-yaml
+runtime: yaml
+description: LocalProgram fixture whose create step fails (command provider)
+resources:
+  ok:
+    type: random:RandomPet
+  boom:
+    type: command:local:Command
+    properties:
+      create: "echo 'this create step is meant to fail' >&2; exit 3"

@@ -1,0 +1,23 @@
+name: engine-parity
+runtime: yaml
+description: CLI parity fixture; run under the library and under the pulumi CLI
+config:
+  petLength:
+    type: integer
+    default: 2
+  apiKey:
+    type: string
+    secret: true
+resources:
+  pet:
+    type: random:RandomPet
+    properties:
+      length: ${petLength}
+  token:
+    type: random:RandomPassword
+    properties:
+      length: 12
+outputs:
+  petName: ${pet.id}
+  token: ${token.result}
+  apiKey: ${apiKey}
