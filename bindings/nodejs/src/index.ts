@@ -20,7 +20,7 @@
  * CLI is involved.
  */
 
-import { native } from "./native";
+import { libraryPath, native } from "./native";
 import { CancelledError, InvalidSpecError, PulumiError } from "./errors";
 import { startInlineServer } from "./inline";
 
@@ -72,8 +72,28 @@ export interface Options {
     dryRun?: boolean;
     /** Environment for the plugins and language host of this operation, over `StackSpec.env`. */
     env?: Record<string, string>;
+    /** Preview only: write the proposed plan to this path (`pulumi preview --save-plan`). */
+    savePlan?: string;
+    /** Preview only: return the proposed plan in `Result.plan`. */
+    generatePlan?: boolean;
+    /** Up only: the path of a plan file the update is constrained to (`pulumi up --plan`). */
+    plan?: string;
+    /** Up only: the plan as a document (what `Result.plan` / a plan file holds) instead of a path. */
+    planJson?: Plan;
     /** Aborting the signal cancels the operation gracefully. */
     signal?: AbortSignal;
+}
+
+/**
+ * An update plan in the CLI's plan file format (`apitype.DeploymentPlanV1`):
+ * the operations a preview proposed, with secret values encrypted by the
+ * stack's secrets provider unless the preview ran with `showSecrets`.
+ */
+export interface Plan {
+    manifest: { time: string; magic?: string; version?: string; plugins?: unknown };
+    config?: Record<string, unknown>;
+    resourcePlans?: Record<string, { goal?: unknown; seed?: string; steps?: string[]; outputs?: unknown }>;
+    [other: string]: unknown;
 }
 
 /**
@@ -160,6 +180,8 @@ export interface Result {
     outputs?: Outputs;
     failures?: { URN: string; Type: string; Op: string; Provider: string; Message: string }[];
     cancelled?: boolean;
+    /** The plan a preview generated (`options.savePlan` or `options.generatePlan`). */
+    plan?: Plan;
     durationMs: number;
 }
 
@@ -457,3 +479,5 @@ export class Stack {
 }
 
 export { CancelledError, PulumiError };
+/** The shared library the binding loads (or would load): `$PULUMI_ENGINE_LIB`, the platform package, or an in-tree build. */
+export { libraryPath };

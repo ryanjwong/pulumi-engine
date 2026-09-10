@@ -22,6 +22,7 @@ export type ErrorKind =
     | "stackExists"
     | "pendingOperations"
     | "cancelled"
+    | "planViolation"
     | "unsupported"
     | "unclassified";
 
@@ -113,6 +114,26 @@ export class CancelledError extends PulumiError {
     }
 }
 
+/** One resource whose operation exceeded the plan an up was constrained to. */
+export interface PlanViolationResource {
+    urn: string;
+    message: string;
+}
+
+/**
+ * An up constrained by a plan (`options.plan` / `options.planJson`) tried to
+ * perform operations the plan did not propose. `resources` lists the
+ * offending resources with the engine's message for each.
+ */
+export class PlanViolationError extends PulumiError {
+    readonly resources: PlanViolationResource[];
+    constructor(resources: PlanViolationResource[], message: string, result?: unknown) {
+        super("planViolation", message, result);
+        this.name = "PlanViolationError";
+        this.resources = resources;
+    }
+}
+
 /**
  * The backend (or Pulumi at the pinned version) does not support the feature
  * asked for: `feature` names it, `backend` the backend it is unsupported on.
@@ -164,6 +185,8 @@ export function errorFromJSON(json: string): PulumiError {
             return new PendingOperationsError((e.urns as string[]) ?? [], message, result);
         case "cancelled":
             return new CancelledError(String(e.operation ?? ""), message, result);
+        case "planViolation":
+            return new PlanViolationError((e.resources as PlanViolationResource[]) ?? [], message, result);
         case "unsupported":
             return new UnsupportedError(String(e.feature ?? ""), String(e.backend ?? ""), message);
         default:

@@ -1,0 +1,200 @@
+name: release
+
+# Tag push `vX.Y.Z`: build libpulumi on one native runner per platform,
+# verify each library loads where it was built (the ABI test and a Node
+# smoke test), attach the tarballs to a GitHub release with generated notes,
+# and publish the Node packages (main + per platform) to GitHub Packages.
+# docs/releasing.md describes the process; nothing here runs on a branch.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  GO_VERSION: "1.26.4"
+  PULUMI_SKIP_UPDATE_CHECK: "true"
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  version:
+    name: version from tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          case "$version" in
+            *[!0-9A-Za-z.-]*|"") echo "tag $tag is not vX.Y.Z[-pre]" >&2; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "releasing $version"
+
+  lib:
+    name: libpulumi ${{ matrix.platform }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every platform builds on its own native runner (no cross
+        # compilation): darwin/arm64 on Apple silicon, darwin/amd64 on the
+        # Intel macOS image, linux/amd64 and linux/arm64 on the matching
+        # Ubuntu images. The verification steps run the built library where
+        # it was built, so they exercise the actual target.
+        include:
+          - os: macos-15
+            platform: darwin-arm64
+          - os: macos-15-intel
+            platform: darwin-amd64
+          - os: ubuntu-24.04
+            platform: linux-amd64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: check the runner matches the platform
+        run: |
+          want="${{ matrix.platform }}"
+          got="$(go env GOOS)-$(go env GOARCH)"
+          test "$want" = "$got" || { echo "runner is $got, expected $want" >&2; exit 1; }
+          uname -a
+      - name: build and package
+        run: make dist-lib VERSION="$VERSION"
+      - name: verify the library loads (cgo ABI test against the built library)
+        run: make abitest VERSION="$VERSION"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: bindings/nodejs/pnpm-lock.yaml
+      - name: verify the library loads from Node (koffi) and reports the release version
+        run: |
+          make node-build VERSION="$VERSION"
+          node -e '
+            const b = require("./bindings/nodejs/dist/src/index.js");
+            const v = b.version();
+            console.log(v);
+            if (!v.startsWith("pulumi-engine " + process.env.VERSION + " ")) { throw new Error("version mismatch: " + v); }
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libpulumi-${{ matrix.platform }}
+          path: |
+            dist/libpulumi-${{ matrix.platform }}.tar.gz
+            dist/libpulumi-${{ matrix.platform }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: github release
+    needs: [version, lib]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: libpulumi-*
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum -c *.sha256
+          sha256sum libpulumi-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: create the release (or upload to an existing one)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" --clobber dist/libpulumi-*.tar.gz dist/libpulumi-*.tar.gz.sha256 dist/SHA256SUMS
+          else
+            prerelease=""
+            case "$tag" in *-*) prerelease="--prerelease" ;; esac
+            gh release create "$tag" --verify-tag --generate-notes $prerelease \
+              --title "$tag" dist/libpulumi-*.tar.gz dist/libpulumi-*.tar.gz.sha256 dist/SHA256SUMS
+          fi
+
+  npm:
+    name: npm packages (GitHub Packages)
+    needs: [version, lib]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      NPM_REGISTRY: https://npm.pkg.github.com
+      NPM_SCOPE: "@${{ github.repository_owner }}"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: libpulumi-*
+          path: dist
+          merge-multiple: true
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: bindings/nodejs/pnpm-lock.yaml
+          registry-url: ${{ env.NPM_REGISTRY }}
+          scope: ${{ env.NPM_SCOPE }}
+      - name: build the packages
+        run: |
+          make node-install
+          cd bindings/nodejs && pnpm build && cd ../..
+          node scripts/package-node.mjs --version "$VERSION" --scope "$NPM_SCOPE" --registry "$NPM_REGISTRY" \
+            --libs dist --out dist/npm --pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-packages
+          path: dist/npm/*.tgz
+          if-no-files-found: error
+      - name: publish
+        # Publishing is skipped, not failed, when the token cannot publish:
+        # NPM_PUBLISH_TOKEN (a PAT with write:packages) is used when set,
+        # otherwise the workflow's GITHUB_TOKEN, which can publish to this
+        # repository's packages when the workflow has `packages: write`.
+        # Versions that already exist are skipped too, so re-running the
+        # workflow for a tag is safe.
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::warning::no NODE_AUTH_TOKEN; skipping npm publish"
+            exit 0
+          fi
+          if ! npm whoami --registry "$NPM_REGISTRY" >/dev/null 2>&1; then
+            echo "::warning::the token cannot authenticate against $NPM_REGISTRY; skipping npm publish"
+            exit 0
+          fi
+          node -e '
+            const m = require("./dist/npm/manifest.json");
+            for (const p of m.packages) console.log(p.name + " " + p.dir);
+          ' | while read -r name dir; do
+            if npm view "$name@$VERSION" version --registry "$NPM_REGISTRY" >/dev/null 2>&1; then
+              echo "$name@$VERSION already published; skipping"
+              continue
+            fi
+            echo "publishing $name@$VERSION"
+            if ! (cd "$dir" && npm publish --registry "$NPM_REGISTRY"); then
+              echo "::warning::npm publish of $name@$VERSION failed (missing permission?); the packages are attached as the npm-packages artifact"
+              exit 0
+            fi
+          done

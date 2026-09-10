@@ -324,3 +324,30 @@ exports.fromEnv = process.env.PULUMI_ENGINE_TEST_ENV;
     await stack.destroy();
     await stack.workspace.removeStack("dev");
 });
+
+test("update plans through the SDK's option shapes: preview({ plan }) saves, up({ plan }) is constrained", async () => {
+    const workDir = copyFixture("yaml-random");
+    const opts = workspaceOptions({ stackSettings: { plan: { config: { petLength: "2" } } } });
+    const stack = await LocalWorkspace.createOrSelectStack({ stackName: "plan", workDir }, opts);
+    const planFile = path.join(workDir, "plan.json");
+
+    const preview = await stack.preview({ plan: planFile });
+    assert.deepEqual(preview.changeSummary, { create: 3 });
+    const plan = JSON.parse(fs.readFileSync(planFile, "utf8"));
+    assert.ok(plan.manifest && plan.resourcePlans, "the plan file is a DeploymentPlanV1");
+
+    const up = await stack.up({ plan: planFile });
+    assert.deepEqual(up.summary.resourceChanges, { create: 3 });
+
+    await stack.preview({ plan: planFile });
+    await stack.setConfig("petLength", { value: "3" });
+    await assert.rejects(stack.up({ plan: planFile }), (e) => {
+        assert.ok(e instanceof CommandError, String(e));
+        assert.equal(e.cause?.kind, "planViolation");
+        assert.ok(e.cause.resources[0].urn.endsWith("::pet"));
+        assert.match(e.message, /plan/);
+        return true;
+    });
+    await stack.destroy();
+    await stack.workspace.removeStack("plan");
+});
