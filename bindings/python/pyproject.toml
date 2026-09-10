@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulumi_engine"
+# The version is set by setup.py from PULUMI_ENGINE_VERSION (the release tag).
+dynamic = ["version"]
+description = "Pulumi engine as an in-process library for Python (cffi over libpulumi)."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Ryan Wong" }]
+requires-python = ">=3.10"
+dependencies = ["cffi>=1.16"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.optional-dependencies]
+# Inline programs run through @pulumi/pulumi's Python LanguageServer.
+inline = ["pulumi>=3.150.0", "grpcio>=1.60"]
+dev = ["pytest>=8", "pytest-timeout>=2.3", "pulumi>=3.150.0", "grpcio>=1.60", "pulumi-random>=4.16"]
+
+[project.urls]
+Homepage = "https://github.com/ryanjwong/pulumi-engine"
+
+[tool.setuptools.packages.find]
+include = ["pulumi_engine*"]
+
+[tool.setuptools.package-data]
+# The shared library, when bundled (see README: "Library lookup").
+pulumi_engine = ["native/libpulumi-*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 600

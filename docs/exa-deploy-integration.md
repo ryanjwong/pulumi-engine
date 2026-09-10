@@ -140,10 +140,13 @@ listing; upstream compatibility tooling"):
    numbers; `Organization` filters are `Unsupported` on DIY). The facade's
    `listTags/setTag/getTag/removeTag`, `history/info` and `listStacks` use
    them, so `ensureStackTags` sets `exa:journal`/`exa:team` for real.
-7. **Update plans** (`preview --save-plan` / `up --plan`, used by the
-   plan-bound `up`) and `PulumiCommand.run` replacements for the paths that
-   still spawn `pulumi` (`stack export --show-secrets` streaming in
-   `stack-export.ts`, state mirrors). **Open.**
+7. **Update plans. Closed (phase three).** `preview({ plan })` writes the
+   plan file and `up({ plan })` is constrained by it through the facade,
+   with the CLI's semantics (`PlanViolationError` on `cause`, nothing beyond
+   the plan applied), so the plan-bound `up` works unchanged.
+8. **`PulumiCommand.run` replacements** for the paths that still spawn
+   `pulumi` (`stack export --show-secrets` streaming in `stack-export.ts`,
+   state mirrors). **Open.**
 
 ## exa-deploy assumptions that presume a `pulumi` binary
 

@@ -62,11 +62,25 @@ const inline = await stack.up(async () => {
 - `listStacks({ url, token? }, { project?, organization?, tagName?, tagValue? })`
   returns `StackSummary[]` (`name`, `fullName`, `project?`, `lastUpdate?`,
   `resourceCount?`).
+- Update plans, with the CLI's semantics: `preview(program, { savePlan:
+  "/path" })` writes the plan file `pulumi preview --save-plan` would
+  (`generatePlan: true` returns it as `result.plan` instead, or as well);
+  `up(program, { plan: "/path" })` or `{ planJson: plan }` constrains the
+  update to it and `result()` rejects with `PlanViolationError` (`resources:
+  [{ urn, message }]`) when the program exceeds the plan; nothing beyond the
+  plan is applied. Plans written by the library are honoured by `pulumi up
+  --plan` and vice versa.
 - The event loop is never blocked: the blocking ABI calls run on koffi's
   async thread pool.
 
-Library lookup: `$PULUMI_ENGINE_LIB`, else
-`lib/native/libpulumi-<platform>-<goarch>.<ext>`, else `../../build/`.
+Library lookup (`libraryPath()` tells which): `$PULUMI_ENGINE_LIB`; the
+per-platform package `@ryanjwong/pulumi-engine-node-<os>-<arch>` (an
+optional dependency of the published package, see
+[docs/releasing.md](../../docs/releasing.md)); `lib/native/libpulumi-<os>-<arch>.<ext>`
+in the source tree; `../../build/`. The published package is named
+`@ryanjwong/pulumi-engine-node` (GitHub Packages requires the owner's
+scope); install it under this name with
+`npm install @pulumi-engine/node@npm:@ryanjwong/pulumi-engine-node`.
 
 Build from the repository root: `make node` (builds the library, copies it
 in, compiles TypeScript and runs the tests). Tests need network on first run
@@ -139,9 +153,10 @@ Implemented, with the SDK's names and shapes:
 
 Gaps — what differs from the SDK over a `pulumi` binary:
 
-- **Update plans** (`plan`/`--save-plan`) reject; **remote workspaces**,
-  policy packs, `importFile`, `attachDebugger`, `color`, log options are
-  ignored.
+- `preview({ plan })` saves a plan and `up({ plan })` is constrained by it
+  as with the CLI (a violation is a `CommandError` whose `cause` is
+  `PlanViolationError`); **remote workspaces**, policy packs, `importFile`,
+  `attachDebugger`, `color`, log options are ignored.
 - `onOutput` receives the facade's own rendering (headers, per-step lines,
   diagnostics, a resource summary), not the CLI's progress display.
 - `createStack` probes then creates (two backend opens); engine handles

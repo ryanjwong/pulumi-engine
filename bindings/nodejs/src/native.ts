@@ -25,26 +25,85 @@ import koffi from "koffi";
 
 import { PulumiError, errorFromJSON } from "./errors";
 
-/** Locate the shared library: $PULUMI_ENGINE_LIB, else the bundled one. */
+/** The platform key the packages are named by: "darwin-arm64", "linux-amd64". */
+export function platformKey(): string {
+    const arch = { x64: "amd64", arm64: "arm64" }[os.arch()] ?? os.arch();
+    return `${os.platform()}-${arch}`;
+}
+
+function libraryExt(): string {
+    return os.platform() === "darwin" ? "dylib" : "so";
+}
+
+/**
+ * The per-platform packages this build declares (written by
+ * scripts/package-node.mjs into the published package.json as
+ * `pulumiEngine.platformPackages`), else the conventional names for both the
+ * publish scope and the source scope.
+ */
+function platformPackageNames(key: string): string[] {
+    const names: string[] = [];
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const pkg = require(path.join(__dirname, "..", "..", "package.json")) as {
+            pulumiEngine?: { platformPackages?: Record<string, string> };
+        };
+        const declared = pkg.pulumiEngine?.platformPackages?.[key];
+        if (declared) {
+            names.push(declared);
+        }
+    } catch {
+        // no package.json next to the build (bundled); fall through
+    }
+    for (const n of [`@ryanjwong/pulumi-engine-node-${key}`, `@pulumi-engine/node-${key}`]) {
+        if (!names.includes(n)) {
+            names.push(n);
+        }
+    }
+    return names;
+}
+
+/**
+ * Locate the shared library, in order: `$PULUMI_ENGINE_LIB`; the platform
+ * package for this OS/CPU (an optionalDependency of the published package,
+ * resolved from this package's location, so a hoisted or nested install both
+ * work); the in-tree `lib/native/` copy `make node` makes; the repository's
+ * `build/` directory.
+ */
 export function libraryPath(): string {
     const override = process.env.PULUMI_ENGINE_LIB;
     if (override) {
         return override;
     }
-    const arch = { x64: "amd64", arm64: "arm64" }[os.arch()] ?? os.arch();
-    const ext = os.platform() === "darwin" ? "dylib" : "so";
-    const candidates = [
-        path.join(__dirname, "..", "..", "lib", "native", `libpulumi-${os.platform()}-${arch}.${ext}`),
+    const key = platformKey();
+    const ext = libraryExt();
+    const tried: string[] = [];
+    for (const name of platformPackageNames(key)) {
+        try {
+            const dir = path.dirname(require.resolve(`${name}/package.json`, { paths: [__dirname] }));
+            const candidate = path.join(dir, `libpulumi.${ext}`);
+            if (fs.existsSync(candidate)) {
+                return candidate;
+            }
+            tried.push(candidate);
+        } catch {
+            tried.push(`${name} (not installed)`);
+        }
+    }
+    const inTree = [
+        path.join(__dirname, "..", "..", "lib", "native", `libpulumi-${key}.${ext}`),
         path.join(__dirname, "..", "..", "..", "..", "build", `libpulumi.${ext}`),
     ];
-    for (const c of candidates) {
+    for (const c of inTree) {
         if (fs.existsSync(c)) {
             return c;
         }
+        tried.push(c);
     }
     throw new Error(
-        `libpulumi not found for ${os.platform()}/${arch}; looked in ${candidates.join(", ")}. ` +
-            `Build it with 'make lib' or set PULUMI_ENGINE_LIB.`,
+        `libpulumi not found for ${key}. Install the platform package ${platformPackageNames(key)[0]} ` +
+            `(an optionalDependency of this package; check that optional dependencies are not disabled and that ` +
+            `${key} is a released platform), build it with 'make lib', or set PULUMI_ENGINE_LIB. Looked in: ${tried.join(", ")}.`,
     );
 }
 

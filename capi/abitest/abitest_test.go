@@ -241,3 +241,35 @@ func TestABIInvalidSpec(t *testing.T) {
 		t.Errorf("NULL err out-parameter must be accepted")
 	}
 }
+
+// Plan options are validated per operation kind and reported through the
+// error JSON; the field names are the ABI's contract.
+func TestABIPlanOptions(t *testing.T) {
+	spec, _ := json.Marshal(map[string]any{
+		"name":    "dev",
+		"project": map[string]any{"name": "abiplan", "dir": t.TempDir()},
+		"backend": map[string]any{"url": "file://" + t.TempDir()},
+		"secrets": map[string]any{"provider": "b64"},
+		"create":  true,
+	})
+	h, e := StackOpen(string(spec))
+	if h == 0 {
+		t.Fatalf("open: %s", e)
+	}
+	defer StackClose(h)
+	for _, c := range []struct{ request, field string }{
+		{`{"kind":"destroy","options":{"savePlan":"/tmp/x.json"}}`, "options.savePlan"},
+		{`{"kind":"refresh","options":{"plan":"/tmp/x.json"}}`, "options.plan"},
+		{`{"kind":"refresh","options":{"planJson":{"manifest":{}}}}`, "options.plan"},
+	} {
+		id, e := OpStart(h, c.request)
+		if id == 0 {
+			t.Fatalf("op_start: %s", e)
+		}
+		drainEvents(t, id)
+		if res, e := OpWait(id); res != "" || decodeErr(t, e)["field"] != c.field {
+			t.Errorf("%s: result %q error %s", c.request, res, e)
+		}
+		OpRelease(id)
+	}
+}

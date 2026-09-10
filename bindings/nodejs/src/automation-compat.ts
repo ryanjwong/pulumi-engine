@@ -201,7 +201,7 @@ export interface UpOptions extends GlobalOpts {
     targetDependents?: boolean;
     exclude?: string[];
     excludeDependents?: boolean;
-    /** Update plans are not supported by the engine library; `up` rejects. */
+    /** Path of a plan file the update is constrained to (`pulumi up --plan`); a mismatch is a `CommandError` whose `cause` is `PlanViolationError`. */
     plan?: string;
     program?: PulumiFn;
     refresh?: boolean;
@@ -224,7 +224,7 @@ export interface PreviewOptions extends GlobalOpts {
     targetDependents?: boolean;
     exclude?: string[];
     excludeDependents?: boolean;
-    /** `--save-plan` is not supported by the engine library; `preview` rejects. */
+    /** Path to save the plan the preview proposes to (`pulumi preview --save-plan`). */
     plan?: string;
     program?: PulumiFn;
     refresh?: boolean;
@@ -707,7 +707,7 @@ function changeCount(changes: OpMap | undefined): number {
     );
 }
 
-function engineOptions(opts: GlobalOpts & Record<string, unknown>, dryRun: boolean): EngineOptions {
+function engineOptions(kind: EngineResult["kind"], opts: GlobalOpts & Record<string, unknown>, dryRun: boolean): EngineOptions {
     const out: EngineOptions = {};
     if (typeof opts.parallel === "number") {
         out.parallel = opts.parallel;
@@ -735,6 +735,15 @@ function engineOptions(opts: GlobalOpts & Record<string, unknown>, dryRun: boole
     }
     if (opts.showSecrets !== undefined) {
         out.showSecrets = Boolean(opts.showSecrets);
+    }
+    // The SDK's `plan` option is `--save-plan` on preview and `--plan` on up;
+    // the engine has one field for each.
+    if (typeof opts.plan === "string" && opts.plan !== "") {
+        if (kind === "preview") {
+            out.savePlan = opts.plan;
+        } else {
+            out.plan = opts.plan;
+        }
     }
     if (dryRun) {
         out.dryRun = true;
@@ -1277,14 +1286,7 @@ export class Stack {
         return { mode: "local", dir: this.workspace.workDir };
     }
 
-    private rejectPlan(opts: { plan?: string }, what: string): void {
-        if (opts.plan) {
-            throw new Error(`${what}: update plans (--plan / --save-plan) are not supported by the in-process engine`);
-        }
-    }
-
     async up(opts: UpOptions = {}): Promise<UpResult> {
-        this.rejectPlan(opts, "up");
         const outcome = await this.run("up", this.program(opts, true), opts, false);
         const summary = await this.latestSummary("update", outcome, opts.message);
         // The SDK's UpResult.outputs shows secret values (`stack output --show-secrets`).
@@ -1293,7 +1295,6 @@ export class Stack {
     }
 
     async preview(opts: PreviewOptions = {}): Promise<PreviewResult> {
-        this.rejectPlan(opts, "preview");
         const outcome = await this.run("preview", this.program(opts, true), opts, false);
         return { stdout: outcome.stdout, stderr: outcome.stderr, changeSummary: outcome.summary?.resourceChanges ?? {} };
     }
@@ -1377,11 +1378,11 @@ export class Stack {
             operation = await (program === undefined
                 ? (handle as unknown as { [k: string]: (p: undefined, o: EngineOptions) => Promise<unknown> })[kind](
                       undefined,
-                      engineOptions(opts, dryRun),
+                      engineOptions(kind, opts, dryRun),
                   )
                 : (handle as unknown as { [k: string]: (p: Program, o: EngineOptions) => Promise<unknown> })[kind](
                       program,
-                      engineOptions(opts, dryRun),
+                      engineOptions(kind, opts, dryRun),
                   ));
         } catch (error) {
             throw this.workspace.translate(error, this.name);

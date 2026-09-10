@@ -19,8 +19,10 @@ import (
 	"sync"
 )
 
-// LibraryVersion is the version of this library.
-const LibraryVersion = "0.1.0"
+// LibraryVersion is the version of this library. Release builds set it from
+// the tag with `-ldflags "-X github.com/ryanjwong/pulumi-engine/engine.LibraryVersion=X.Y.Z"`
+// (see the Makefile's VERSION); development builds report the default.
+var LibraryVersion = "0.1.0-dev"
 
 var (
 	pulumiVersionOnce sync.Once

@@ -25,6 +25,7 @@ import { test } from "node:test";
 import {
     CancelledError,
     InvalidSpecError,
+    PlanViolationError,
     ResourceOpFailedError,
     Secret,
     StackNotFoundError,
@@ -309,5 +310,57 @@ exports.nodePath = process.env.NODE_PATH;
     await destroy.result();
     await destroy.release();
     stack.remove();
+    stack.close();
+});
+
+test("update plans: preview saves, up is constrained, a mismatch is a PlanViolationError", async () => {
+    const dir = copyFixture("yaml-random");
+    const stack = await openStack({
+        name: "plan",
+        project: { dir },
+        backend: { url: "file://" + tmp("state") },
+        secrets: { provider: "passphrase", passphrase: "pw" },
+        config: { petLength: "2" },
+        create: true,
+    });
+    const program = { mode: "local" as const, dir, languageVersion: "1.38.5" };
+    const planFile = path.join(dir, "plan.json");
+
+    const preview = await stack.preview(program, { savePlan: planFile, generatePlan: true });
+    const previewResult = await preview.result();
+    await preview.release();
+    assert.ok(previewResult.plan, "generatePlan returns the plan");
+    assert.deepEqual(previewResult.plan, JSON.parse(fs.readFileSync(planFile, "utf8")));
+    assert.ok(Object.keys(previewResult.plan!.resourcePlans ?? {}).length >= 2);
+
+    const up = await stack.up(program, { plan: planFile });
+    const upResult = await up.result();
+    await up.release();
+    assert.equal(upResult.changes.create, 3);
+
+    // A fresh plan proposes no changes; a replace exceeds it.
+    const same = await stack.preview(program, { generatePlan: true });
+    const samePlan = (await same.result()).plan!;
+    await same.release();
+    stack.setConfig("petLength", "3");
+    const bad = await stack.up(program, { planJson: samePlan });
+    await assert.rejects(bad.result(), (e: unknown) => {
+        assert.ok(e instanceof PlanViolationError, `expected PlanViolationError, got ${String(e)}`);
+        assert.equal(e.kind, "planViolation");
+        assert.ok(e.resources.length >= 1 && e.resources[0].urn.endsWith("::pet"), JSON.stringify(e.resources));
+        assert.match(e.resources[0].message, /plan/);
+        return true;
+    });
+    await bad.release();
+    // plan options are validated per kind
+    await assert.rejects(
+        (await stack.preview(program, { plan: planFile })).result(),
+        (e: unknown) => e instanceof InvalidSpecError && e.field === "options.plan",
+    );
+
+    const destroy = await stack.destroy();
+    await destroy.result();
+    await destroy.release();
+    stack.remove(true);
     stack.close();
 });
