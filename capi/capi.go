@@ -43,7 +43,15 @@ package main
 //   Error strings are JSON: {"kind": "...", "message": "..."} plus kind
 //   specific fields (urn/type/op/provider for resourceOpFailed, urns for
 //   pendingOperations, field for invalidSpec, name for stackNotFound and
-//   stackExists, operation for cancelled, feature/backend for unsupported).
+//   stackExists, operation for cancelled, feature/backend for unsupported,
+//   resources [{urn, message}] for planViolation).
+//
+// Update plans
+//   A preview request with options {"savePlan": "/path"} writes the plan
+//   file `pulumi preview --save-plan` would; {"generatePlan": true} returns
+//   it in the result's "plan" field instead (or as well). An up request with
+//   {"plan": "/path"} or {"planJson": {...}} is constrained to that plan and
+//   fails with a planViolation error when the program exceeds it.
 //
 // Events
 //   pulumi_op_next_event blocks up to timeout_ms (negative: forever) for the
@@ -106,11 +114,14 @@ func errorJSON(err error) string {
 		ex   engine.StackExists
 		canc engine.Cancelled
 		uns  engine.Unsupported
+		plan engine.PlanViolation
 	)
 	switch {
 	case errors.As(err, &inv):
 		m["field"] = inv.Field
 		m["message"] = inv.Message
+	case errors.As(err, &plan):
+		m["resources"] = plan.Resources
 	case errors.As(err, &rof):
 		m["urn"], m["type"], m["op"], m["provider"] = rof.URN, rof.Type, rof.Op, rof.Provider
 		if rof.Message != "" {

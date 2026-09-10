@@ -37,6 +37,7 @@ const (
 	KindStackExists       ErrorKind = "stackExists"
 	KindPendingOperations ErrorKind = "pendingOperations"
 	KindCancelled         ErrorKind = "cancelled"
+	KindPlanViolation     ErrorKind = "planViolation"
 	KindUnsupported       ErrorKind = "unsupported"
 	KindUnclassified      ErrorKind = "unclassified"
 )
@@ -178,11 +179,14 @@ func KindOf(err error) ErrorKind {
 		exists   StackExists
 		pending  PendingOperations
 		canc     Cancelled
+		plan     PlanViolation
 		unsup    Unsupported
 	)
 	switch {
 	case errors.As(err, &invalid):
 		return KindInvalidSpec
+	case errors.As(err, &plan):
+		return KindPlanViolation
 	case errors.As(err, &resOp):
 		return KindResourceOpFailed
 	case errors.As(err, &program):
@@ -260,7 +264,14 @@ func (o *Operation) classifyOperationError(err error) error {
 	o.mu.Lock()
 	failures := append([]ResourceOpFailed(nil), o.failures...)
 	diags := append([]string(nil), o.errorDiags...)
+	var violations []PlanViolationResource
+	if o.planned {
+		violations = o.planViolations()
+	}
 	o.mu.Unlock()
+	if len(violations) > 0 {
+		return PlanViolation{Resources: violations}
+	}
 	if len(failures) > 0 {
 		return failures[0]
 	}

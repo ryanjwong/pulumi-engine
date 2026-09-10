@@ -16,9 +16,11 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -76,6 +78,20 @@ type Options struct {
 	// Env is added to StackSpec.Env for the plugins and language hosts this
 	// operation launches (a key set here wins over the stack's).
 	Env map[string]string `json:"env,omitempty"`
+
+	// SavePlan (preview only) writes the plan the preview proposed to this
+	// path, in the CLI's plan file format (`pulumi preview --save-plan`).
+	SavePlan string `json:"savePlan,omitempty"`
+	// GeneratePlan (preview only) returns the proposed plan in Result.Plan
+	// without writing a file.
+	GeneratePlan bool `json:"generatePlan,omitempty"`
+	// Plan (up only) is the path of a plan file the update is constrained
+	// to (`pulumi up --plan`). Operations the plan did not propose fail the
+	// update with PlanViolation.
+	Plan string `json:"plan,omitempty"`
+	// PlanJSON (up only) is a plan given by content instead of by path; the
+	// same JSON document a SavePlan file holds. Mutually exclusive with Plan.
+	PlanJSON json.RawMessage `json:"planJson,omitempty"`
 }
 
 // Result summarises a finished operation. It is populated on failure too,
@@ -92,6 +108,9 @@ type Result struct {
 	Failures []ResourceOpFailed `json:"failures,omitempty"`
 	// Cancelled is set when the operation was cancelled.
 	Cancelled bool `json:"cancelled,omitempty"`
+	// Plan is the plan a preview generated (Options.SavePlan or
+	// Options.GeneratePlan), in the CLI's plan file format.
+	Plan json.RawMessage `json:"plan,omitempty"`
 	// Duration is the wall-clock time of the operation.
 	Duration time.Duration `json:"duration"`
 }
@@ -120,6 +139,7 @@ type Operation struct {
 	terminateOnce   sync.Once
 
 	mu         sync.Mutex
+	planned    bool
 	sequence   int
 	summary    *apitype.SummaryEvent
 	failures   []ResourceOpFailed
@@ -256,6 +276,9 @@ func (o *Operation) execute(ctx context.Context, program Program, opts Options) 
 	if opts.DryRun && o.kind == KindUp {
 		return InvalidSpec{Field: "options.dryRun", Message: "use Preview instead of Up with DryRun"}
 	}
+	if err := validatePlanOptions(o.kind, opts); err != nil {
+		return err
+	}
 	if !s.opMu.TryLock() {
 		return ConcurrentUpdate{Err: fmt.Errorf("another %s is running on this stack handle", o.kind)}
 	}
@@ -329,6 +352,21 @@ func (o *Operation) execute(ctx context.Context, program Program, opts Options) 
 		ContinueOnError:  opts.ContinueOnError,
 		ShowSecrets:      opts.ShowSecrets,
 		ExecKind:         "auto.inline",
+		// Plans: generated on preview when asked for (the CLI's --save-plan),
+		// consumed on up (--plan). See plan.go.
+		GeneratePlan: o.kind == KindPreview && (opts.SavePlan != "" || opts.GeneratePlan),
+	}
+	if o.kind == KindUp {
+		plan, err := loadPlan(opts, sm.Decrypter())
+		if err != nil {
+			return err
+		}
+		if plan != nil {
+			engineOpts.Plan = plan
+			o.mu.Lock()
+			o.planned = true
+			o.mu.Unlock()
+		}
 	}
 	disp := display.Options{
 		Color:               colors.Never,
@@ -397,7 +435,11 @@ func (o *Operation) execute(ctx context.Context, program Program, opts Options) 
 			}
 		}()
 		if o.kind == KindPreview {
-			_, _, opErr = backend.PreviewStack(bctx, s.stack, uop, raw)
+			var plan *deploy.Plan
+			plan, _, opErr = backend.PreviewStack(bctx, s.stack, uop, raw)
+			if opErr == nil && engineOpts.GeneratePlan {
+				opErr = o.savePlan(plan, sm.Encrypter(), opts)
+			}
 		} else {
 			_, opErr = backend.UpdateStack(bctx, s.stack, uop, raw)
 		}
@@ -417,6 +459,27 @@ func (o *Operation) execute(ctx context.Context, program Program, opts Options) 
 		}
 	}
 	return opErr
+}
+
+// savePlan encodes the plan a preview generated into Result.Plan and, with
+// Options.SavePlan, writes it to that path.
+func (o *Operation) savePlan(plan *deploy.Plan, enc config.Encrypter, opts Options) error {
+	if plan == nil {
+		return Unclassified{Err: fmt.Errorf("the preview did not produce a plan")}
+	}
+	encoded, err := encodePlan(plan, enc, opts.ShowSecrets)
+	if err != nil {
+		return Unclassified{Err: fmt.Errorf("serializing plan: %w", err)}
+	}
+	if opts.SavePlan != "" {
+		if err := os.WriteFile(opts.SavePlan, encoded, 0o600); err != nil {
+			return InvalidSpec{Field: "options.savePlan", Message: err.Error()}
+		}
+	}
+	o.mu.Lock()
+	o.result.Plan = json.RawMessage(encoded)
+	o.mu.Unlock()
+	return nil
 }
 
 // mergeEnv overlays op on base.
