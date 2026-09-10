@@ -68,6 +68,10 @@ export interface Native {
     stackGetConfig(handle: number, key: string): string;
     stackRemove(handle: number, force: boolean): void;
     stackCancel(handle: number): void;
+    stackGetTags(handle: number): string;
+    stackSetTags(handle: number, tagsJson: string): void;
+    stackHistory(handle: number, optionsJson: string): string;
+    listStacks(requestJson: string): string;
 }
 
 let cached: Native | undefined;
@@ -115,6 +119,10 @@ export function native(): Native {
         stackGetConfig: lib.func("pulumi_stack_get_config", "void *", ["int64_t", "str", outErr]),
         stackRemove: lib.func("pulumi_stack_remove", "int", ["int64_t", "int", outErr]),
         stackCancel: lib.func("pulumi_stack_cancel", "int", ["int64_t", outErr]),
+        stackGetTags: lib.func("pulumi_stack_get_tags", "void *", ["int64_t", outErr]),
+        stackSetTags: lib.func("pulumi_stack_set_tags", "int", ["int64_t", "str", outErr]),
+        stackHistory: lib.func("pulumi_stack_history", "void *", ["int64_t", "str", outErr]),
+        listStacks: lib.func("pulumi_list_stacks", "void *", ["str", outErr]),
     };
 
     const unknown = (what: string, id: number) =>
@@ -212,6 +220,29 @@ export function native(): Native {
             const err: Ptr[] = [null];
             f.stackCancel(h, err);
             check(err);
+        },
+        stackGetTags: (h) => {
+            const err: Ptr[] = [null];
+            const s = take(f.stackGetTags(h, err));
+            check(err);
+            return s ?? "{}";
+        },
+        stackSetTags: (h, tags) => {
+            const err: Ptr[] = [null];
+            f.stackSetTags(h, tags, err);
+            check(err);
+        },
+        stackHistory: (h, options) => {
+            const err: Ptr[] = [null];
+            const s = take(f.stackHistory(h, options, err));
+            check(err);
+            return s ?? "[]";
+        },
+        listStacks: (request) => {
+            const err: Ptr[] = [null];
+            const s = take(f.listStacks(request, err));
+            check(err);
+            return s ?? "[]";
         },
     };
     return cached;

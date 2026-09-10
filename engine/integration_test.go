@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -35,6 +36,15 @@ import (
 	"github.com/pulumi/pulumi-random/sdk/v4/go/random"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
+
+// yamlLanguageVersion pins the pulumi-language-yaml release the tests install
+// when no YAML host is on PATH or in the plugin cache (CI has one next to the
+// pulumi CLI; the pin only matters without it).
+const yamlLanguageVersion = "1.38.5"
+
+func localProgram(dir string) LocalProgram {
+	return LocalProgram{Dir: dir, LanguageVersion: yamlLanguageVersion}
+}
 
 func integrationSpec(t *testing.T, name string, dir string) StackSpec {
 	t.Helper()
@@ -67,7 +77,7 @@ func drain(t *testing.T, op *Operation) []Event {
 	if dir := os.Getenv("PULUMI_ENGINE_RECORD_DIR"); dir != "" {
 		recordMu.Lock()
 		recordSeq++
-		name := fmt.Sprintf("%s-%02d-%s.jsonl", strings.TrimPrefix(t.Name(), "TestIntegration"), recordSeq, op.Kind())
+		name := fmt.Sprintf("%s-%02d-%s.jsonl", strings.ReplaceAll(strings.TrimPrefix(t.Name(), "TestIntegration"), "/", "-"), recordSeq, op.Kind())
 		recordMu.Unlock()
 		var buf strings.Builder
 		for _, e := range events {
@@ -123,28 +133,32 @@ func assertEnvelope(t *testing.T, events []Event) {
 	if len(events) < 2 {
 		t.Fatalf("expected at least prelude and summary, got %v", eventTypes(events))
 	}
-	// Diagnostics (plugin warnings) may precede the prelude; resource events
-	// may not.
+	// Diagnostics (plugin warnings) and the captured backend banner (stdout)
+	// may precede the prelude; resource events may not.
 	prelude := -1
 	for i, e := range events {
 		if e.Type == EventPrelude {
 			prelude = i
 			break
 		}
-		if e.Type != EventDiagnostic {
+		if e.Type != EventDiagnostic && e.Type != EventStdout {
 			t.Errorf("event %s before prelude (all: %v, diagnostics: %v)", e.Type, eventTypes(events), diagnostics(events))
 		}
 	}
 	if prelude < 0 {
 		t.Errorf("no prelude event (all: %v)", eventTypes(events))
 	}
-	last := events[len(events)-1]
-	if last.Type != EventSummary {
-		t.Errorf("last event should be summary, got %s (all: %v)", last.Type, eventTypes(events))
+	// The stream ends with the summary and then the engine's cancel
+	// terminator, as `pulumi --event-log` does.
+	if n := len(events); events[n-1].Type != EventCancel || events[n-2].Type != EventSummary {
+		t.Errorf("stream should end with summary, cancel; got %v", eventTypes(events))
 	}
-	for _, e := range events {
-		if e.Type == EventCancel {
-			t.Errorf("cancel events are internal and must not be delivered")
+	for i, e := range events {
+		if e.Sequence != i || e.Timestamp == 0 {
+			t.Errorf("event %d: sequence %d timestamp %d", i, e.Sequence, e.Timestamp)
+		}
+		if e.Type == EventCancel && i != len(events)-1 {
+			t.Errorf("cancel event before the end of the stream")
 		}
 	}
 }
@@ -434,7 +448,7 @@ func TestIntegrationLocalYAML(t *testing.T) {
 		t.Errorf("Pulumi.yaml.yaml stack config should have been written: %v", err)
 	}
 
-	program := LocalProgram{Dir: dir}
+	program := localProgram(dir)
 	op := st.Preview(ctx, program, Options{})
 	events := drain(t, op)
 	res, err := op.Wait()
@@ -481,7 +495,7 @@ func TestIntegrationLocalYAMLResourceFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Remove(context.Background(), true) })
 
-	op := st.Up(ctx, LocalProgram{Dir: dir}, Options{})
+	op := st.Up(ctx, localProgram(dir), Options{})
 	events := drain(t, op)
 	res, err := op.Wait()
 	var rof ResourceOpFailed
@@ -525,7 +539,7 @@ func TestIntegrationCancelMidUp(t *testing.T) {
 	t.Cleanup(func() { _ = st.Remove(context.Background(), true) })
 
 	cctx, cancel := context.WithCancel(ctx)
-	op := st.Up(cctx, LocalProgram{Dir: dir}, Options{})
+	op := st.Up(cctx, localProgram(dir), Options{})
 	// cancel once the first slow create has started
 	go func() {
 		for e := range op.Events() {
@@ -610,4 +624,146 @@ func copyFixture(t *testing.T, name string) string {
 		}
 	}
 	return dst
+}
+
+// buildEnvEcho compiles the envecho test provider and returns a directory
+// holding it as pulumi-resource-envecho, to be put on PATH.
+func buildEnvEcho(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "pulumi-resource-envecho")
+	cmd := exec.Command("go", "build", "-o", bin, "../internal/testplugin/envecho")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("building envecho: %v\n%s", err, out)
+	}
+	return dir
+}
+
+// echoProgram registers one envecho:index:Echo resource reading the variable
+// named name from the provider's environment and exports its value. nonce is
+// an input that forces a replacement (and so a fresh read of the environment)
+// when it changes.
+func echoProgram(name, nonce string) Program {
+	return GoProgram(func(ctx *pulumi.Context) error {
+		var r struct {
+			pulumi.CustomResourceState
+			Value pulumi.StringOutput `pulumi:"value"`
+			Pid   pulumi.Float64Output `pulumi:"pid"`
+		}
+		inputs := pulumi.Map{"name": pulumi.String(name), "nonce": pulumi.String(nonce)}
+		if err := ctx.RegisterResource("envecho:index:Echo", "echo", inputs, &r); err != nil {
+			return err
+		}
+		ctx.Export("value", r.Value)
+		ctx.Export("pid", r.Pid)
+		return nil
+	})
+}
+
+// TestIntegrationPluginEnvConcurrent: two operations in one process, each
+// with its own StackSpec.Env, run at the same time; the provider each one
+// launches sees its own environment (and nothing is set on this process).
+func TestIntegrationPluginEnvConcurrent(t *testing.T) {
+	specA := integrationSpec(t, "a", "")
+	specB := integrationSpec(t, "b", "")
+	specA.Env = map[string]string{"PULUMI_ENGINE_TEST_ENV": "alpha"}
+	specB.Env = map[string]string{"PULUMI_ENGINE_TEST_ENV": "beta"}
+	t.Setenv("PATH", buildEnvEcho(t)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PULUMI_ENGINE_TEST_ENV", "process")
+	ctx := context.Background()
+	stA, err := Open(ctx, specA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stB, err := Open(ctx, specB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	program := echoProgram("PULUMI_ENGINE_TEST_ENV", "1")
+	opA := stA.Up(ctx, program, Options{})
+	opB := stB.Up(ctx, program, Options{})
+	resA, eventsA, errA := waitOp(t, opA)
+	resB, eventsB, errB := waitOp(t, opB)
+	if errA != nil || errB != nil {
+		t.Fatalf("up: %v / %v\nA: %v\nB: %v", errA, errB, diagnostics(eventsA), diagnostics(eventsB))
+	}
+	if resA.Outputs.Values["value"] != "alpha" || resB.Outputs.Values["value"] != "beta" {
+		t.Errorf("provider env: A=%v B=%v", resA.Outputs.Values, resB.Outputs.Values)
+	}
+	if resA.Outputs.Values["pid"] == resB.Outputs.Values["pid"] {
+		t.Errorf("both operations used one provider process: %v", resA.Outputs.Values["pid"])
+	}
+	if os.Getenv("PULUMI_ENGINE_TEST_ENV") != "process" {
+		t.Errorf("the process environment was modified")
+	}
+
+	// Options.Env overrides the stack's for one operation; a later operation
+	// without it sees the stack's again.
+	op := stA.Up(ctx, echoProgram("PULUMI_ENGINE_TEST_ENV", "2"), Options{Env: map[string]string{"PULUMI_ENGINE_TEST_ENV": "op-level"}})
+	res, events, err := waitOp(t, op)
+	if err != nil || res.Outputs.Values["value"] != "op-level" {
+		t.Errorf("Options.Env: %v %v %v", res.Outputs, err, diagnostics(events))
+	}
+	op = stA.Up(ctx, echoProgram("PULUMI_ENGINE_TEST_ENV", "3"), Options{})
+	if res, events, err := waitOp(t, op); err != nil || res.Outputs.Values["value"] != "alpha" {
+		t.Errorf("up with the stack env again: %v %v %v", res.Outputs, err, diagnostics(events))
+	}
+	for _, st := range []*Stack{stA, stB} {
+		op := st.Destroy(ctx, nil, Options{})
+		if _, events, err := waitOp(t, op); err != nil {
+			t.Errorf("destroy: %v %v", err, diagnostics(events))
+		}
+	}
+}
+
+// TestIntegrationLanguageHostEnv: a local Node program run by
+// pulumi-language-nodejs sees the spec env (NODE_PATH resolves @pulumi/pulumi
+// from the binding's node_modules through it, so the program cannot even
+// load without the env reaching the host).
+func TestIntegrationLanguageHostEnv(t *testing.T) {
+	if _, err := exec.LookPath("pulumi-language-nodejs"); err != nil {
+		t.Skip("pulumi-language-nodejs not on PATH")
+	}
+	nodeModules, err := filepath.Abs(filepath.Join("..", "bindings", "nodejs", "node_modules"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(nodeModules, "@pulumi", "pulumi")); err != nil {
+		t.Skip("bindings/nodejs/node_modules not installed (make node-install)")
+	}
+	dir := t.TempDir()
+	writeFile := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile("Pulumi.yaml", "name: engine-yaml\nruntime: nodejs\n")
+	writeFile("index.js", `const pulumi = require("@pulumi/pulumi");
+exports.fromEnv = process.env.PULUMI_ENGINE_TEST_ENV;
+exports.nodePath = process.env.NODE_PATH;
+`)
+	spec := integrationSpec(t, "node", dir)
+	spec.Env = map[string]string{"NODE_PATH": nodeModules, "PULUMI_ENGINE_TEST_ENV": "hello-from-spec"}
+	ctx := context.Background()
+	st, err := Open(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := st.Up(ctx, LocalProgram{Dir: dir}, Options{})
+	res, events, err := waitOp(t, op)
+	if err != nil {
+		t.Fatalf("up: %v\n%v", err, diagnostics(events))
+	}
+	assertEnvelope(t, events)
+	if res.Outputs.Values["fromEnv"] != "hello-from-spec" || res.Outputs.Values["nodePath"] != nodeModules {
+		t.Errorf("language host env: %v", res.Outputs.Values)
+	}
+	op = st.Up(ctx, LocalProgram{Dir: dir}, Options{Env: map[string]string{"PULUMI_ENGINE_TEST_ENV": "from-op"}})
+	if res, events, err := waitOp(t, op); err != nil || res.Outputs.Values["fromEnv"] != "from-op" {
+		t.Errorf("Options.Env for the language host: %v %v %v", res.Outputs, err, diagnostics(events))
+	}
+	op = st.Destroy(ctx, nil, Options{})
+	if _, events, err := waitOp(t, op); err != nil {
+		t.Errorf("destroy: %v %v", err, diagnostics(events))
+	}
 }

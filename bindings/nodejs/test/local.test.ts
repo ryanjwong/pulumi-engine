@@ -16,6 +16,7 @@
 // host and the random/command providers (downloaded on first use).
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -27,6 +28,7 @@ import {
     ResourceOpFailedError,
     Secret,
     StackNotFoundError,
+    listStacks,
     openStack,
     version,
     type Event,
@@ -62,10 +64,11 @@ test("invalid spec is a typed error", async () => {
 });
 
 test("offline lifecycle with a program-less stack", async () => {
+    const state = tmp("state");
     const stack = await openStack({
         name: "dev",
         project: { name: "node-offline", dir: tmp("proj") },
-        backend: { url: "file://" + tmp("state") },
+        backend: { url: "file://" + state },
         secrets: { provider: "b64" },
         config: { greeting: "hi", token: new Secret("s3cret") },
         create: true,
@@ -80,7 +83,35 @@ test("offline lifecycle with a program-less stack", async () => {
     const res = await refresh.result();
     await refresh.release();
     assert.equal(res.kind, "refresh");
-    assert.equal(types(events).at(-1), "summary");
+    // The library's stream ends with the cancel terminator after the summary,
+    // and numbers its own events.
+    assert.equal(types(events).at(-1), "cancel");
+    assert.equal(types(events).at(-2), "summary");
+    assert.deepEqual(
+        events.map((e) => e.sequence),
+        events.map((_, i) => i),
+    );
+    assert.ok(events.every((e) => e.timestamp > 0));
+
+    // tags, history and the backend's stack listing
+    stack.setTags({ owner: "node", env: "test" });
+    assert.deepEqual(stack.getTags(), { owner: "node", env: "test" });
+    stack.setTags({ owner: "node" });
+    assert.deepEqual(stack.getTags(), { owner: "node" });
+
+    const history = stack.history();
+    assert.ok(Array.isArray(history));
+    assert.equal(history[0].kind, "refresh");
+    assert.equal(history[0].result, "succeeded");
+    assert.ok(history[0].startTime > 0 && history[0].endTime >= history[0].startTime);
+    assert.equal(stack.history({ limit: 1, page: 1 }).length, 1);
+
+    const listed = listStacks({ url: "file://" + state }, { project: "node-offline" });
+    assert.deepEqual(
+        listed.map((s) => s.name),
+        ["dev"],
+    );
+    assert.match(listed[0].fullName, /\/node-offline\/dev$/);
 
     const exported = stack.export() as { version: number };
     assert.equal(exported.version, 3);
@@ -125,7 +156,8 @@ test("local YAML program: preview, up, destroy", async () => {
     assert.ok(previewResult.summary?.isPreview);
     assert.equal(previewResult.changes.create, 3);
     assert.ok(types(previewEvents).includes("prelude"));
-    assert.equal(types(previewEvents).at(-1), "summary");
+    assert.equal(types(previewEvents).at(-1), "cancel");
+    assert.equal(types(previewEvents).at(-2), "summary");
 
     const up = await stack.up(program, { message: "from node" });
     const seen: string[] = [];
@@ -209,5 +241,73 @@ test("AbortSignal cancels an up", async () => {
     await destroy.result();
     await destroy.release();
     stack.remove(true);
+    stack.close();
+});
+
+test("spec env reaches the language host and providers", async () => {
+    try {
+        execFileSync("which", ["pulumi-language-nodejs"], { stdio: "ignore" });
+    } catch {
+        // The Node language host ships with the pulumi CLI; without it on
+        // PATH the engine cannot run a `runtime: nodejs` project.
+        console.log("skipped: pulumi-language-nodejs is not on PATH (install the pulumi CLI)");
+        return;
+    }
+    const dir = tmp("node-env");
+    fs.writeFileSync(path.join(dir, "Pulumi.yaml"), "name: node-env\nruntime: nodejs\n");
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "node-env", main: "index.js" }));
+    fs.writeFileSync(
+        path.join(dir, "index.js"),
+        `const pulumi = require("@pulumi/pulumi");
+exports.fromEnv = process.env.PULUMI_ENGINE_TEST_ENV;
+exports.nodePath = process.env.NODE_PATH;
+`,
+    );
+    // @pulumi/pulumi is resolved through NODE_PATH alone: the program can
+    // only load it if the spec's env reached the language host.
+    const nodeModules = path.resolve(__dirname, "..", "..", "node_modules");
+    const stack = await openStack({
+        name: "dev",
+        project: { dir },
+        backend: { url: "file://" + tmp("state") },
+        secrets: { provider: "b64" },
+        env: { PULUMI_ENGINE_TEST_ENV: "hello-from-spec", NODE_PATH: nodeModules },
+        create: true,
+    });
+    const program = { mode: "local" as const, dir };
+
+    const up = await stack.up(program);
+    const events = await up.events();
+    const result = await up.result();
+    await up.release();
+    assert.equal(result.outputs?.values.fromEnv, "hello-from-spec");
+    assert.equal(result.outputs?.values.nodePath, nodeModules);
+
+    // The library numbers events, stamps them, ends the stream with `cancel`
+    // and delivers the DIY backend's banner as a stdout event.
+    assert.deepEqual(
+        events.map((e) => e.sequence),
+        events.map((_, i) => i),
+    );
+    assert.ok(events.every((e) => e.timestamp > 0));
+    assert.equal(events.at(-1)!.type, "cancel");
+    assert.deepEqual(events.at(-1)!.cancelEvent, {});
+    assert.ok(
+        events.some((e) => e.type === "stdout" && String(e.stdoutEvent?.message).includes("Updating (dev):")),
+        "the backend banner arrives as a stdout event",
+    );
+
+    // Options.env overlays the spec's env for one operation.
+    const second = await stack.up(program, { env: { PULUMI_ENGINE_TEST_ENV: "from-op" } });
+    await second.events();
+    const secondResult = await second.result();
+    await second.release();
+    assert.equal(secondResult.outputs?.values.fromEnv, "from-op");
+    assert.equal(secondResult.outputs?.values.nodePath, nodeModules);
+
+    const destroy = await stack.destroy();
+    await destroy.result();
+    await destroy.release();
+    stack.remove();
     stack.close();
 });

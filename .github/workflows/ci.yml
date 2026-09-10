@@ -10,6 +10,13 @@ env:
   # The CLI the parity tests run against; keep equal to the pkg/v3 pin in go.mod.
   PULUMI_CLI_VERSION: "3.237.0"
   PULUMI_SKIP_UPDATE_CHECK: "true"
+  # Pulumi's plugin installer authenticates GitHub release downloads with
+  # GITHUB_TOKEN when set (sdk workspace/plugins.go), which lifts the
+  # anonymous rate limit that made plugin downloads flaky.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # One plugin cache for every job; the cache key is shared so a job restores
+  # what another saved (Pulumi's cache is keyed by plugin name and version).
+  PULUMI_PLUGIN_CACHE_KEY: pulumi-plugins-v2
 
 jobs:
   go:
@@ -22,6 +29,7 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
       - run: make build
       - run: make test
+      - run: make upstream-check
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
@@ -45,7 +53,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.pulumi/plugins
-          key: pulumi-plugins-${{ runner.os }}-${{ hashFiles('engine/integration_test.go', 'engine/parity_test.go') }}
+          key: ${{ env.PULUMI_PLUGIN_CACHE_KEY }}-${{ runner.os }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: bindings/nodejs/pnpm-lock.yaml
+      - name: install the Node SDK (for the language-host env test)
+        run: make node-install
       - run: make integration
 
   lib:
@@ -101,5 +119,5 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.pulumi/plugins
-          key: pulumi-plugins-node-${{ runner.os }}
+          key: ${{ env.PULUMI_PLUGIN_CACHE_KEY }}-${{ runner.os }}
       - run: make node
