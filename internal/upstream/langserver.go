@@ -1,4 +1,3 @@
-// Copyright 2016-2023, Pulumi Corporation.
 // Copyright 2026 Ryan Wong
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,13 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package engine
+// Copied from pulumi/pulumi (Apache-2.0, Pulumi Corporation).
+//
+// upstream: github.com/pulumi/pulumi/sdk/v3@v3.237.0 go/auto/stack.go sha256=2d2de5c48e115cd77c52d383781fe9f98141a0ce92ea237e3f2739597db6fe68
+// upstream-reason: the in-process LanguageRuntime gRPC server the Go
+//   Automation API uses for inline programs is unexported in sdk/go/auto,
+//   and importing that package would pull the CLI shell-out machinery in.
+// upstream-delete-when: sdk/go/auto (or a new sdk package) exports an
+//   in-process language runtime server that does not depend on the CLI.
 
-// This file is adapted from the unexported languageRuntimeServer in
-// github.com/pulumi/pulumi/sdk/v3/go/auto (stack.go), Apache-2.0, Pulumi
-// Corporation. It is the in-process LanguageRuntime the Go Automation API
-// uses for inline programs; copying it is preferable to depending on the
-// auto package (which would pull the CLI shell-out machinery in).
+package upstream
 
 import (
 	"context"
@@ -35,6 +37,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
+// upstream-begin: go/auto/stack.go (languageRuntimeServer)
 const (
 	stateWaiting = iota
 	stateRunning
@@ -42,7 +45,9 @@ const (
 	stateFinished
 )
 
-type languageRuntimeServer struct {
+// LanguageRuntimeServer is an in-process LanguageRuntime gRPC server that
+// runs one Go function per Run request.
+type LanguageRuntimeServer struct {
 	pulumirpc.UnimplementedLanguageRuntimeServer
 
 	m sync.Mutex
@@ -75,12 +80,13 @@ func isNestedInvocation() bool {
 	}
 }
 
-func startLanguageRuntimeServer(fn pulumi.RunFunc) (*languageRuntimeServer, error) {
+// StartLanguageRuntimeServer serves fn on a loopback port.
+func StartLanguageRuntimeServer(fn pulumi.RunFunc) (*LanguageRuntimeServer, error) {
 	if isNestedInvocation() {
 		return nil, errors.New("nested stack operations are not supported https://github.com/pulumi/pulumi/issues/5058")
 	}
 
-	s := &languageRuntimeServer{
+	s := &LanguageRuntimeServer{
 		fn:     fn,
 		cancel: make(chan bool),
 	}
@@ -101,7 +107,7 @@ func startLanguageRuntimeServer(fn pulumi.RunFunc) (*languageRuntimeServer, erro
 	return s, nil
 }
 
-func (s *languageRuntimeServer) Close() error {
+func (s *LanguageRuntimeServer) Close() error {
 	s.m.Lock()
 	switch s.state {
 	case stateCanceled:
@@ -122,13 +128,13 @@ func (s *languageRuntimeServer) Close() error {
 	return <-s.done
 }
 
-func (s *languageRuntimeServer) GetRequiredPlugins(ctx context.Context,
+func (s *LanguageRuntimeServer) GetRequiredPlugins(ctx context.Context,
 	req *pulumirpc.GetRequiredPluginsRequest,
 ) (*pulumirpc.GetRequiredPluginsResponse, error) {
 	return &pulumirpc.GetRequiredPluginsResponse{}, nil
 }
 
-func (s *languageRuntimeServer) Run(ctx context.Context, req *pulumirpc.RunRequest) (*pulumirpc.RunResponse, error) {
+func (s *LanguageRuntimeServer) Run(ctx context.Context, req *pulumirpc.RunRequest) (*pulumirpc.RunResponse, error) {
 	s.m.Lock()
 	if s.state == stateCanceled {
 		s.m.Unlock()
@@ -185,15 +191,20 @@ func (s *languageRuntimeServer) Run(ctx context.Context, req *pulumirpc.RunReque
 	return &pulumirpc.RunResponse{}, nil
 }
 
-func (s *languageRuntimeServer) GetPluginInfo(ctx context.Context, req *emptypb.Empty) (*pulumirpc.PluginInfo, error) {
+func (s *LanguageRuntimeServer) GetPluginInfo(ctx context.Context, req *emptypb.Empty) (*pulumirpc.PluginInfo, error) {
 	return &pulumirpc.PluginInfo{
 		Version: "1.0.0",
 	}, nil
 }
 
-func (s *languageRuntimeServer) InstallDependencies(
+func (s *LanguageRuntimeServer) InstallDependencies(
 	req *pulumirpc.InstallDependenciesRequest,
 	server pulumirpc.LanguageRuntime_InstallDependenciesServer,
 ) error {
 	return nil
 }
+
+// upstream-end: go/auto/stack.go
+
+// Address is the "host:port" the server listens on.
+func (s *LanguageRuntimeServer) Address() string { return s.address }

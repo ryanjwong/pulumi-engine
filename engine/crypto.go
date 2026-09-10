@@ -32,6 +32,8 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/secrets/service"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
+
+	"github.com/ryanjwong/pulumi-engine/internal/upstream"
 )
 
 // specSecretsProvider reconstructs secrets managers from checkpoint state
@@ -39,7 +41,8 @@ import (
 // provider, which prompts on a terminal or reads PULUMI_CONFIG_PASSPHRASE
 // from the process environment.
 type specSecretsProvider struct {
-	passphrase string
+	passphrase    string
+	hasPassphrase bool
 }
 
 var _ secrets.Provider = specSecretsProvider{}
@@ -49,7 +52,7 @@ func (p specSecretsProvider) OfType(ctx context.Context, ty string, state json.R
 	var err error
 	switch ty {
 	case passphrase.Type:
-		if p.passphrase == "" {
+		if !p.hasPassphrase {
 			return nil, errors.New("the checkpoint is encrypted with a passphrase but the spec provides none")
 		}
 		var st struct {
@@ -58,7 +61,7 @@ func (p specSecretsProvider) OfType(ctx context.Context, ty string, state json.R
 		if err := json.Unmarshal(state, &st); err != nil {
 			return nil, fmt.Errorf("decoding passphrase secrets state: %w", err)
 		}
-		sm, err = passphrase.GetPassphraseSecretsManager(p.passphrase, st.Salt)
+		sm, err = passphraseManager(p.passphrase, st.Salt)
 		if errors.Is(err, passphrase.ErrIncorrectPassphrase) {
 			return nil, InvalidSpec{Field: "secrets.passphrase", Message: "incorrect passphrase for this stack"}
 		}
@@ -75,6 +78,18 @@ func (p specSecretsProvider) OfType(ctx context.Context, ty string, state json.R
 		return nil, fmt.Errorf("constructing secrets manager of type %q: %w", ty, err)
 	}
 	return stack.NewBatchingCachingSecretsManager(sm), nil
+}
+
+// passphraseManager returns the passphrase secrets manager for an existing
+// salt. Pulumi caches these process-wide by salt and ignores the passphrase
+// on a cache hit (the CLI has one passphrase per process); the passphrase is
+// verified first so that a wrong one is rejected whoever opened the stack
+// before.
+func passphraseManager(phrase, salt string) (secrets.Manager, error) {
+	if err := upstream.VerifyPassphrase(phrase, salt); err != nil {
+		return nil, err
+	}
+	return passphrase.GetPassphraseSecretsManager(phrase, salt)
 }
 
 // checkpointSecrets peeks at the stack's checkpoint for the secrets manager
@@ -116,7 +131,7 @@ func newSecretsManager(ctx context.Context, spec SecretsSpec, bs backend.Stack, 
 			}
 		}
 		if salt != "" {
-			sm, err := passphrase.GetPassphraseSecretsManager(spec.Passphrase, salt)
+			sm, err := passphraseManager(spec.Passphrase, salt)
 			if errors.Is(err, passphrase.ErrIncorrectPassphrase) {
 				return nil, InvalidSpec{Field: "secrets.passphrase", Message: "incorrect passphrase for this stack"}
 			}

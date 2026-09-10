@@ -73,6 +73,9 @@ type Options struct {
 	// DryRun turns Refresh and Destroy into previews. Preview ignores it and
 	// Up rejects it.
 	DryRun bool `json:"dryRun,omitempty"`
+	// Env is added to StackSpec.Env for the plugins and language hosts this
+	// operation launches (a key set here wins over the stack's).
+	Env map[string]string `json:"env,omitempty"`
 }
 
 // Result summarises a finished operation. It is populated on failure too,
@@ -99,8 +102,9 @@ type Result struct {
 // reads Events. Events are delivered in engine order. The channel closes
 // after the last event, before Wait returns.
 type Operation struct {
-	kind  Kind
-	stack *Stack
+	kind   Kind
+	stack  *Stack
+	dryRun bool
 
 	queue  *eventQueue
 	events chan Event
@@ -116,6 +120,7 @@ type Operation struct {
 	terminateOnce   sync.Once
 
 	mu         sync.Mutex
+	sequence   int
 	summary    *apitype.SummaryEvent
 	failures   []ResourceOpFailed
 	errorDiags []string
@@ -190,6 +195,7 @@ func (s *Stack) Destroy(ctx context.Context, program Program, opts Options) *Ope
 
 func (s *Stack) start(ctx context.Context, kind Kind, program Program, opts Options) *Operation {
 	op := newOperation(kind, s)
+	op.dryRun = opts.DryRun && kind != KindPreview
 	op.pendingFn = func() []string { return s.pendingOperationURNs(context.WithoutCancel(ctx)) }
 	s.mu.Lock()
 	s.running[op] = struct{}{}
@@ -222,6 +228,10 @@ func (o *Operation) finish(start time.Time, err error) {
 	delete(o.stack.running, o)
 	o.stack.mu.Unlock()
 
+	// The stream ends with the engine's cancel event, as `pulumi --event-log`
+	// and therefore the Automation API's stream do: it is the terminator, not
+	// a sign that anything was cancelled.
+	o.push(eventFromAPI(apitype.EngineEvent{CancelEvent: &apitype.CancelEvent{}}))
 	o.queue.close()
 	close(o.done)
 }
@@ -263,6 +273,13 @@ func (o *Operation) execute(ctx context.Context, program Program, opts Options) 
 	}
 	defer func() { _ = prep.close() }()
 
+	stackRef := s.stack.Ref().String()
+	o.listenStdout(stackRef)
+	defer func() {
+		flushStdoutCapture()
+		o.unlistenStdout(stackRef)
+	}()
+
 	proj := *s.project
 	if prep.project != nil {
 		proj = *prep.project
@@ -284,11 +301,25 @@ func (o *Operation) execute(ctx context.Context, program Program, opts Options) 
 		return InvalidSpec{Field: "config", Message: err.Error()}
 	}
 
+	// The plugin host: Pulumi's default host on a context of this
+	// operation's own, so that provider and language-host launches carry the
+	// spec's (and the operation's) environment. See pluginhost.go.
+	decrypted, err := cfg.Decrypt(sm.Decrypter())
+	if err != nil {
+		return Unclassified{Err: fmt.Errorf("decrypting config: %w", err)}
+	}
+	host, err := newOperationHost(bctx, o, &proj, prep.root, decrypted, mergeEnv(s.spec.Env, opts.Env), opts.ShowSecrets)
+	if err != nil {
+		return Unclassified{Err: err}
+	}
+	defer host.close()
+
 	parallel := int32(math.MaxInt32)
 	if opts.Parallel > 0 && opts.Parallel < math.MaxInt32 {
 		parallel = int32(opts.Parallel)
 	}
 	engineOpts := pulumiengine.UpdateOptions{
+		Host:             host,
 		Parallel:         parallel,
 		Refresh:          opts.Refresh,
 		Targets:          deploy.NewUrnTargets(opts.Targets),
@@ -388,12 +419,40 @@ func (o *Operation) execute(ctx context.Context, program Program, opts Options) 
 	return opErr
 }
 
+// mergeEnv overlays op on base.
+func mergeEnv(base, op map[string]string) map[string]string {
+	if len(base) == 0 && len(op) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(base)+len(op))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range op {
+		out[k] = v
+	}
+	return out
+}
+
+// push stamps the event with its sequence number and timestamp (what the
+// CLI's display layer does for `--event-log`) and queues it.
+func (o *Operation) push(ev Event) {
+	o.mu.Lock()
+	ev.Sequence = o.sequence
+	o.sequence++
+	o.mu.Unlock()
+	if ev.Timestamp == 0 {
+		ev.Timestamp = int(time.Now().Unix())
+	}
+	o.queue.push(ev)
+}
+
 // handleEvent records what error classification needs and queues the event.
 func (o *Operation) handleEvent(ev Event) {
 	if ev.Type == EventCancel {
-		// The engine's cancel event is a stream terminator, not a signal
-		// that anything was cancelled; the closed Events channel plays that
-		// role here.
+		// The engine's cancel event terminates its stream; the operation
+		// emits its own terminator once, in finish, after the last event
+		// from any source (engine channel, event sink, plugin host, stdout).
 		return
 	}
 	// Strip Pulumi's colour markup ("<{%reset%}>") from human-readable text;
@@ -432,7 +491,7 @@ func (o *Operation) handleEvent(ev Event) {
 		}
 	}
 	o.mu.Unlock()
-	o.queue.push(ev)
+	o.push(ev)
 }
 
 // fillFailureMessages attaches error diagnostics to the resource failures

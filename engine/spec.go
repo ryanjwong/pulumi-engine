@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -52,6 +53,18 @@ type StackSpec struct {
 	// Create creates the stack when it does not exist yet. When false, Open
 	// returns StackNotFound for a missing stack.
 	Create bool `json:"create,omitempty"`
+
+	// Env is the environment given to every provider plugin and language
+	// host an operation on this stack launches, overlaid on the process
+	// environment (a key set here wins). It is where per-stack credentials,
+	// PULUMI_HOME for the plugins' own use, NODE_PATH and program variables
+	// go; it is never applied to this process, so concurrent operations with
+	// different Env do not interfere. Options.Env adds to it per operation.
+	//
+	// Not covered: the library's own plugin resolution and downloads read
+	// PULUMI_HOME (and GITHUB_TOKEN) from the process environment; see
+	// docs/upstream.md.
+	Env map[string]string `json:"env,omitempty"`
 }
 
 // ProjectSpec identifies the Pulumi project.
@@ -90,10 +103,41 @@ type BackendSpec struct {
 // "service" (default for HTTP backends), a cloud KMS URL ("awskms://...",
 // "gcpkms://...", "azurekeyvault://...", "hashivault://..."), or "b64" (no
 // encryption at all; only for tests).
+//
+// The empty passphrase is valid, as it is for the CLI when
+// PULUMI_CONFIG_PASSPHRASE is set to "". Because Go cannot tell an empty
+// string from an absent one, an empty passphrase must be confirmed with
+// PassphraseSet; in JSON, the presence of the "passphrase" key is enough.
 type SecretsSpec struct {
 	Provider   string `json:"provider,omitempty"`
 	Passphrase string `json:"passphrase,omitempty"`
+	// PassphraseSet confirms that Passphrase is intentionally empty. Set
+	// automatically when the spec is decoded from JSON with a "passphrase"
+	// key.
+	PassphraseSet bool `json:"passphraseSet,omitempty"`
 }
+
+// UnmarshalJSON records whether the "passphrase" key was present so that an
+// explicit empty passphrase is distinguishable from none.
+func (s *SecretsSpec) UnmarshalJSON(data []byte) error {
+	type plain SecretsSpec
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return err
+	}
+	if _, ok := keys["passphrase"]; ok {
+		p.PassphraseSet = true
+	}
+	*s = SecretsSpec(p)
+	return nil
+}
+
+// hasPassphrase reports whether a passphrase (possibly empty) was provided.
+func (s SecretsSpec) hasPassphrase() bool { return s.Passphrase != "" || s.PassphraseSet }
 
 // ConfigValue is one configuration value. Secret values are encrypted with
 // the stack's secrets provider before they reach Pulumi.
@@ -187,14 +231,20 @@ func (s *StackSpec) validate() error {
 	default:
 		return InvalidSpec{Field: "secrets.provider", Message: fmt.Sprintf("unknown secrets provider %q", s.Secrets.Provider)}
 	}
-	if s.Secrets.Provider == secretsPassphrase && s.Secrets.Passphrase == "" {
-		return InvalidSpec{Field: "secrets.passphrase", Message: "the passphrase secrets provider requires a passphrase"}
+	if s.Secrets.Provider == secretsPassphrase && !s.Secrets.hasPassphrase() {
+		return InvalidSpec{Field: "secrets.passphrase", Message: "the passphrase secrets provider requires a passphrase (set passphraseSet for an intentionally empty one)"}
 	}
 	if s.Secrets.Provider == secretsService && isDIYBackend(s.Backend.URL) {
 		return InvalidSpec{Field: "secrets.provider", Message: "the service secrets provider requires an HTTP backend"}
 	}
-	if s.Secrets.Provider != secretsPassphrase && s.Secrets.Passphrase != "" {
+	if s.Secrets.Provider != secretsPassphrase && s.Secrets.hasPassphrase() {
 		return InvalidSpec{Field: "secrets.passphrase", Message: "passphrase is only used by the passphrase provider"}
+	}
+
+	for k := range s.Env {
+		if k == "" || strings.Contains(k, "=") {
+			return InvalidSpec{Field: "env", Message: fmt.Sprintf("invalid environment variable name %q", k)}
+		}
 	}
 
 	for k, v := range s.Config {
