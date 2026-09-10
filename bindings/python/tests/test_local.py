@@ -97,18 +97,19 @@ def test_cancel_from_another_thread_while_blocked(copy_fixture, spec) -> None:
         op = stack.up(local(dir))
 
         # Cancel once the first slow create has started, from a thread that
-        # reads events while the main thread is blocked in result().
+        # reads events while the main thread is blocked in result(). This is
+        # also the GIL check: result() is one foreign call (pulumi_op_wait)
+        # entered before any event exists; if cffi did not release the GIL
+        # around it, the watcher could neither read events nor cancel, and
+        # the up would run its three 6 s creates to completion instead of
+        # ending in CancelledError. A ticker thread counts as well, so the
+        # failure message says how much Python ran meanwhile.
         def watch() -> None:
             for e in op:
                 pre = e.get("resourcePreEvent")
                 if pre and pre["metadata"]["urn"].endswith("::slow1"):
                     op.cancel()
 
-        watcher = threading.Thread(target=watch, daemon=True)
-        watcher.start()
-
-        # A ticker thread must keep running while result() blocks: cffi
-        # releases the GIL around the foreign call.
         ticks = 0
         stop = threading.Event()
 
@@ -118,10 +119,11 @@ def test_cancel_from_another_thread_while_blocked(copy_fixture, spec) -> None:
                 ticks += 1
                 time.sleep(0.01)
 
+        watcher = threading.Thread(target=watch, daemon=True)
         ticker = threading.Thread(target=tick, daemon=True)
-        ticker.start()
-
         started = time.monotonic()
+        watcher.start()
+        ticker.start()
         with pytest.raises(CancelledError) as info:
             op.result()
         elapsed = time.monotonic() - started
@@ -130,10 +132,10 @@ def test_cancel_from_another_thread_while_blocked(copy_fixture, spec) -> None:
         watcher.join(timeout=10)
         op.release()
 
-        assert ticks > 10, f"ticker made {ticks} increments while result() blocked {elapsed:.1f}s"
+        assert elapsed < 15, f"result() blocked {elapsed:.1f}s: the watcher's cancel never took effect ({ticks} ticks)"
+        assert ticks > 0, "the ticker thread never ran while result() blocked"
         assert info.value.result is not None and info.value.result["cancelled"] is True
         assert info.value.operation == "up"
-        assert elapsed < 40
 
         dep = stack.export()["deployment"]
         assert dep.get("pending_operations") in (None, [])
