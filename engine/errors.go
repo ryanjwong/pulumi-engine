@@ -37,6 +37,7 @@ const (
 	KindStackExists       ErrorKind = "stackExists"
 	KindPendingOperations ErrorKind = "pendingOperations"
 	KindCancelled         ErrorKind = "cancelled"
+	KindUnsupported       ErrorKind = "unsupported"
 	KindUnclassified      ErrorKind = "unclassified"
 )
 
@@ -133,6 +134,28 @@ type Cancelled struct {
 
 func (e Cancelled) Error() string { return fmt.Sprintf("%s cancelled", e.Operation) }
 
+// Unsupported reports that the backend (or Pulumi at the pinned version) does
+// not support the requested feature. It is returned instead of a panic or a
+// silently ignored argument.
+type Unsupported struct {
+	// Feature names what was asked for ("listStacks.organization").
+	Feature string
+	// Backend is the backend URL scheme the feature is unsupported on.
+	Backend string
+	Message string
+}
+
+func (e Unsupported) Error() string {
+	msg := fmt.Sprintf("%s is not supported", e.Feature)
+	if e.Backend != "" {
+		msg += " on " + e.Backend + " backends"
+	}
+	if e.Message != "" {
+		msg += ": " + e.Message
+	}
+	return msg
+}
+
 // Unclassified wraps an error this library could not map to a more specific
 // kind. The wrapped error is Pulumi's own.
 type Unclassified struct {
@@ -155,6 +178,7 @@ func KindOf(err error) ErrorKind {
 		exists   StackExists
 		pending  PendingOperations
 		canc     Cancelled
+		unsup    Unsupported
 	)
 	switch {
 	case errors.As(err, &invalid):
@@ -173,6 +197,8 @@ func KindOf(err error) ErrorKind {
 		return KindPendingOperations
 	case errors.As(err, &canc):
 		return KindCancelled
+	case errors.As(err, &unsup):
+		return KindUnsupported
 	default:
 		return KindUnclassified
 	}

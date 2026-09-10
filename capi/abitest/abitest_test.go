@@ -70,13 +70,15 @@ func TestABISmoke(t *testing.T) {
 		t.Errorf("version = %q", v)
 	}
 
+	backendURL := "file://" + t.TempDir()
 	spec, _ := json.Marshal(map[string]any{
 		"name":    "dev",
 		"project": map[string]any{"name": "abi", "dir": t.TempDir()},
-		"backend": map[string]any{"url": "file://" + t.TempDir()},
+		"backend": map[string]any{"url": backendURL},
 		"secrets": map[string]any{"provider": "b64"},
 		"config":  map[string]any{"greeting": map[string]any{"value": "hi"}},
 		"create":  true,
+		"env":     map[string]any{"PULUMI_ENGINE_ABI_TEST": "1"},
 	})
 	h, e := StackOpen(string(spec))
 	if h == 0 {
@@ -97,7 +99,7 @@ func TestABISmoke(t *testing.T) {
 		t.Fatalf("op_start failed: %v", decodeErr(t, e))
 	}
 	types, timeouts := drainEvents(t, id)
-	if len(types) == 0 || types[len(types)-1] != "summary" {
+	if n := len(types); n < 2 || types[n-1] != "cancel" || types[n-2] != "summary" {
 		t.Errorf("events %v", types)
 	}
 	t.Logf("events %v (timeouts %d)", types, timeouts)
@@ -129,6 +131,29 @@ func TestABISmoke(t *testing.T) {
 	}
 	if out, _ := StackOutputs(h, true); !strings.Contains(out, `"secret":"shh"`) {
 		t.Errorf("showSecrets outputs %s", out)
+	}
+
+	// tags, history, listing
+	if rc, e := StackSetTags(h, `{"exa:team":"abi"}`); rc != 0 {
+		t.Fatalf("set_tags: %v", decodeErr(t, e))
+	}
+	if tags, e := StackGetTags(h); tags != `{"exa:team":"abi"}` {
+		t.Errorf("get_tags = %s (%v)", tags, decodeErr(t, e))
+	}
+	if rc, e := StackSetTags(h, `{"bad tag":"x"}`); rc != -1 || decodeErr(t, e)["kind"] != "invalidSpec" {
+		t.Errorf("set_tags validation: rc=%d %v", rc, decodeErr(t, e))
+	}
+	if hist, e := StackHistory(h, `{"limit":1}`); !strings.Contains(hist, `"kind":"update"`) || !strings.Contains(hist, `"message":"abi"`) {
+		t.Errorf("history = %s (%v)", hist, decodeErr(t, e))
+	}
+	if hist, e := StackHistory(h, ""); !strings.Contains(hist, `"result":"succeeded"`) {
+		t.Errorf("history without options = %s (%v)", hist, decodeErr(t, e))
+	}
+	if list, e := ListStacks(`{"backend":{"url":"` + backendURL + `"},"filter":{"project":"abi"}}`); !strings.Contains(list, `"fullName":"organization/abi/dev"`) {
+		t.Errorf("list_stacks = %s (%v)", list, decodeErr(t, e))
+	}
+	if list, e := ListStacks(`{"backend":{"url":"` + backendURL + `"},"filter":{"organization":"acme"}}`); list != "" || decodeErr(t, e)["kind"] != "unsupported" {
+		t.Errorf("list_stacks organization on diy: %s %v", list, decodeErr(t, e))
 	}
 
 	if rc, e := StackSetConfig(h, "token", `{"value":"s3cret","secret":true}`); rc != 0 {

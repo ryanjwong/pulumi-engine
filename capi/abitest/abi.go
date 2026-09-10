@@ -158,3 +158,37 @@ func StackCancel(h int64) (rc int, errJSON string) {
 	e, _ := take(cerr)
 	return int(r), e
 }
+
+func StackGetTags(h int64) (tags string, errJSON string) {
+	var cerr *C.char
+	v, _ := take(C.pulumi_stack_get_tags(C.int64_t(h), &cerr))
+	e, _ := take(cerr)
+	return v, e
+}
+
+func StackSetTags(h int64, tagsJSON string) (rc int, errJSON string) {
+	var cerr *C.char
+	cs := C.CString(tagsJSON)
+	defer C.free(unsafe.Pointer(cs))
+	r := C.pulumi_stack_set_tags(C.int64_t(h), cs, &cerr)
+	e, _ := take(cerr)
+	return int(r), e
+}
+
+func StackHistory(h int64, optionsJSON string) (history string, errJSON string) {
+	var cerr *C.char
+	cs := C.CString(optionsJSON)
+	defer C.free(unsafe.Pointer(cs))
+	v, _ := take(C.pulumi_stack_history(C.int64_t(h), cs, &cerr))
+	e, _ := take(cerr)
+	return v, e
+}
+
+func ListStacks(requestJSON string) (list string, errJSON string) {
+	var cerr *C.char
+	cs := C.CString(requestJSON)
+	defer C.free(unsafe.Pointer(cs))
+	v, _ := take(C.pulumi_list_stacks(cs, &cerr))
+	e, _ := take(cerr)
+	return v, e
+}

@@ -20,12 +20,15 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/blang/semver"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
 	pkgworkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+
+	"github.com/ryanjwong/pulumi-engine/internal/upstream"
 )
 
 // Program is the Pulumi program an operation runs. Three implementations
@@ -70,12 +73,12 @@ type goProgram struct {
 }
 
 func (p goProgram) prepare(_ context.Context, st *Stack) (*preparedProgram, error) {
-	srv, err := startLanguageRuntimeServer(p.fn)
+	srv, err := upstream.StartLanguageRuntimeServer(p.fn)
 	if err != nil {
 		return nil, fmt.Errorf("starting in-process language runtime: %w", err)
 	}
 	return &preparedProgram{
-		runtime: workspace.NewProjectRuntimeInfo(clientRuntimeName, map[string]any{"address": srv.address}),
+		runtime: workspace.NewProjectRuntimeInfo(clientRuntimeName, map[string]any{"address": srv.Address()}),
 		root:    st.root,
 		close:   srv.Close,
 	}, nil
@@ -85,13 +88,13 @@ func (p goProgram) prepare(_ context.Context, st *Stack) (*preparedProgram, erro
 // Go function, for use as a CallbackProgram (for example through the C ABI,
 // which cannot take a Go function).
 type GoProgramServer struct {
-	srv *languageRuntimeServer
+	srv *upstream.LanguageRuntimeServer
 }
 
 // ServeGoProgram starts a loopback LanguageRuntime server for fn. Close it
 // after the operation that used it has finished.
 func ServeGoProgram(fn func(ctx *pulumi.Context) error) (*GoProgramServer, error) {
-	srv, err := startLanguageRuntimeServer(fn)
+	srv, err := upstream.StartLanguageRuntimeServer(fn)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +102,7 @@ func ServeGoProgram(fn func(ctx *pulumi.Context) error) (*GoProgramServer, error
 }
 
 // Address is the "host:port" to pass as CallbackProgram.Address.
-func (s *GoProgramServer) Address() string { return s.srv.address }
+func (s *GoProgramServer) Address() string { return s.srv.Address() }
 
 // Close stops the server, waiting for a running program to finish.
 func (s *GoProgramServer) Close() error { return s.srv.Close() }
@@ -128,6 +131,11 @@ func (p CallbackProgram) prepare(_ context.Context, st *Stack) (*preparedProgram
 // subprocess and downloaded on first use like any other plugin.
 type LocalProgram struct {
 	Dir string
+	// LanguageVersion pins the version of the language host plugin
+	// (pulumi-language-<runtime>) that is installed when none is found on
+	// PATH or in the plugin cache. Empty installs the latest release. A host
+	// already on PATH or in the cache is used regardless, as the CLI would.
+	LanguageVersion string `json:"languageVersion,omitempty"`
 }
 
 func (p LocalProgram) prepare(ctx context.Context, st *Stack) (*preparedProgram, error) {
@@ -146,7 +154,7 @@ func (p LocalProgram) prepare(ctx context.Context, st *Stack) (*preparedProgram,
 		return nil, InvalidSpec{Field: "program.dir", Message: fmt.Sprintf(
 			"Pulumi.yaml project %q does not match the stack's project %q", proj.Name, st.spec.Project.Name)}
 	}
-	if err := ensureLanguagePlugin(ctx, st.sink, proj.Runtime.Name()); err != nil {
+	if err := ensureLanguagePlugin(ctx, st.sink, proj.Runtime.Name(), p.LanguageVersion); err != nil {
 		return nil, err
 	}
 	return &preparedProgram{
@@ -162,7 +170,7 @@ func (p LocalProgram) prepare(ctx context.Context, st *Stack) (*preparedProgram,
 // cannot be found on PATH or in the plugin cache. Providers are installed on
 // demand by Pulumi's provider registry; language hosts are not, so this is
 // the one place the library has to do it.
-func ensureLanguagePlugin(ctx context.Context, sink diag.Sink, runtime string) error {
+func ensureLanguagePlugin(ctx context.Context, sink diag.Sink, runtime, version string) error {
 	spec := workspace.PluginDescriptor{Kind: apitype.LanguagePlugin, Name: runtime}
 	if _, err := workspace.GetPluginPath(ctx, sink, spec, nil); err == nil {
 		return nil
@@ -171,6 +179,13 @@ func ensureLanguagePlugin(ctx context.Context, sink diag.Sink, runtime string) e
 		if !errors.As(err, &missing) {
 			return fmt.Errorf("locating language plugin %q: %w", runtime, err)
 		}
+	}
+	if version != "" {
+		v, err := semver.ParseTolerant(version)
+		if err != nil {
+			return InvalidSpec{Field: "program.languageVersion", Message: err.Error()}
+		}
+		spec.Version = &v
 	}
 	log := func(sev diag.Severity, msg string) { sink.Logf(sev, diag.RawMessage("", msg)) }
 	if _, err := pkgworkspace.InstallPlugin(ctx, spec, log, schema.NewLoaderServerFromHost); err != nil {

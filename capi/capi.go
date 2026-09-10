@@ -43,7 +43,7 @@ package main
 //   Error strings are JSON: {"kind": "...", "message": "..."} plus kind
 //   specific fields (urn/type/op/provider for resourceOpFailed, urns for
 //   pendingOperations, field for invalidSpec, name for stackNotFound and
-//   stackExists, operation for cancelled).
+//   stackExists, operation for cancelled, feature/backend for unsupported).
 //
 // Events
 //   pulumi_op_next_event blocks up to timeout_ms (negative: forever) for the
@@ -105,6 +105,7 @@ func errorJSON(err error) string {
 		nf   engine.StackNotFound
 		ex   engine.StackExists
 		canc engine.Cancelled
+		uns  engine.Unsupported
 	)
 	switch {
 	case errors.As(err, &inv):
@@ -123,6 +124,8 @@ func errorJSON(err error) string {
 		m["name"] = ex.Name
 	case errors.As(err, &canc):
 		m["operation"] = string(canc.Operation)
+	case errors.As(err, &uns):
+		m["feature"], m["backend"] = uns.Feature, uns.Backend
 	}
 	b, _ := json.Marshal(m)
 	return string(b)
@@ -204,9 +207,10 @@ func pulumi_stack_close(h C.int64_t) C.int {
 type opRequest struct {
 	Kind    engine.Kind `json:"kind"`
 	Program *struct {
-		Mode    string `json:"mode"` // "local" | "callback"
-		Dir     string `json:"dir,omitempty"`
-		Address string `json:"address,omitempty"`
+		Mode            string `json:"mode"` // "local" | "callback"
+		Dir             string `json:"dir,omitempty"`
+		Address         string `json:"address,omitempty"`
+		LanguageVersion string `json:"languageVersion,omitempty"`
 	} `json:"program,omitempty"`
 	Options engine.Options `json:"options"`
 }
@@ -234,7 +238,7 @@ func pulumi_op_start(h C.int64_t, requestJSON *C.char, err **C.char) C.int64_t {
 	if req.Program != nil {
 		switch req.Program.Mode {
 		case "local":
-			program = engine.LocalProgram{Dir: req.Program.Dir}
+			program = engine.LocalProgram{Dir: req.Program.Dir, LanguageVersion: req.Program.LanguageVersion}
 		case "callback":
 			program = engine.CallbackProgram{Address: req.Program.Address}
 		default:
@@ -483,4 +487,94 @@ func pulumi_stack_cancel(h C.int64_t, err **C.char) C.int {
 		return -1
 	}
 	return 0
+}
+
+// pulumi_stack_get_tags returns the stack's tags as a JSON object.
+//
+//export pulumi_stack_get_tags
+func pulumi_stack_get_tags(h C.int64_t, err **C.char) *C.char {
+	st, ok := reg.stack(int64(h))
+	if !ok {
+		setErrf(err, "unknown stack handle %d", int64(h))
+		return nil
+	}
+	tags, e := st.GetTags(context.Background())
+	if e != nil {
+		setErr(err, e)
+		return nil
+	}
+	b, _ := json.Marshal(tags)
+	return cstr(string(b))
+}
+
+// pulumi_stack_set_tags replaces the stack's tags with the JSON object
+// given. Returns 0 or -1 (err set).
+//
+//export pulumi_stack_set_tags
+func pulumi_stack_set_tags(h C.int64_t, tagsJSON *C.char, err **C.char) C.int {
+	st, ok := reg.stack(int64(h))
+	if !ok {
+		setErrf(err, "unknown stack handle %d", int64(h))
+		return -1
+	}
+	var tags map[string]string
+	if e := json.Unmarshal([]byte(gostr(tagsJSON)), &tags); e != nil {
+		setErr(err, engine.InvalidSpec{Field: "tags", Message: e.Error()})
+		return -1
+	}
+	if e := st.SetTags(context.Background(), tags); e != nil {
+		setErr(err, e)
+		return -1
+	}
+	return 0
+}
+
+// pulumi_stack_history returns the stack's update history, newest first, as
+// a JSON array of UpdateInfo. Options JSON: {"limit": N, "page": N,
+// "showSecrets": bool} (may be empty or NULL).
+//
+//export pulumi_stack_history
+func pulumi_stack_history(h C.int64_t, optionsJSON *C.char, err **C.char) *C.char {
+	st, ok := reg.stack(int64(h))
+	if !ok {
+		setErrf(err, "unknown stack handle %d", int64(h))
+		return nil
+	}
+	var opts engine.HistoryOptions
+	if raw := gostr(optionsJSON); raw != "" {
+		if e := json.Unmarshal([]byte(raw), &opts); e != nil {
+			setErr(err, engine.InvalidSpec{Field: "options", Message: e.Error()})
+			return nil
+		}
+	}
+	hist, e := st.History(context.Background(), opts)
+	if e != nil {
+		setErr(err, e)
+		return nil
+	}
+	b, _ := json.Marshal(hist)
+	return cstr(string(b))
+}
+
+// pulumi_list_stacks lists the stacks of a backend as a JSON array of
+// StackSummary. Request JSON: {"backend": {"url": ..., "token": ...},
+// "filter": {"project": ..., "organization": ..., "tagName": ..., "tagValue": ...}}.
+//
+//export pulumi_list_stacks
+func pulumi_list_stacks(requestJSON *C.char, err **C.char) *C.char {
+	var req struct {
+		Backend engine.BackendSpec `json:"backend"`
+		Filter  engine.ListFilter  `json:"filter"`
+	}
+	if e := json.Unmarshal([]byte(gostr(requestJSON)), &req); e != nil {
+		setErr(err, engine.InvalidSpec{Field: "request", Message: e.Error()})
+		return nil
+	}
+	list, e := engine.ListStacks(context.Background(), req.Backend, req.Filter)
+	if e != nil {
+		setErr(err, e)
+		return nil
+	}
+	b, _ := json.Marshal(list)
+	return cstr(string(b))
 }

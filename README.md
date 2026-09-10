@@ -132,7 +132,9 @@ do for the CLI); `https://` selects the HTTP backend (Pulumi Cloud or a
 self-hosted implementation).
 
 Secrets providers per stack: `passphrase` (default for DIY; the passphrase is
-a spec field, never `PULUMI_CONFIG_PASSPHRASE`), `service` (default for HTTP),
+a spec field, never `PULUMI_CONFIG_PASSPHRASE`; the empty passphrase is valid
+when confirmed with `PassphraseSet`, or by the presence of the `passphrase`
+key in JSON, as `PULUMI_CONFIG_PASSPHRASE=""` is for the CLI), `service` (default for HTTP),
 a KMS URL (`awskms://`, `gcpkms://`, `azurekeyvault://`, `hashivault://`), or
 `b64` for tests. Existing key material (the passphrase salt, the KMS data key)
 is picked up from `Pulumi.<stack>.yaml` in `Project.Dir` or from the
@@ -144,20 +146,50 @@ overlaid with `StackSpec.Config`; `SetConfig` writes back to that file, like
 `pulumi config set`. Project-level config schema and defaults from
 `Pulumi.yaml` are applied and validated for local programs.
 
+**HTTP backend credentials** come from `Backend.Token` only: never from
+`PULUMI_ACCESS_TOKEN`, never from a `pulumi login`. Each open backend keeps
+its own token, so operations with different tokens (even for one URL) run
+concurrently without interfering. The one thing Pulumi leaves process-global
+is the hand-off (`httpstate.New` has no constructor that takes a token; see
+[docs/upstream.md](docs/upstream.md) #3): under a lock the token is written
+to Pulumi's credentials file for the URL, the backend is constructed, and the
+file is restored byte for byte, or deleted if it did not exist.
+
+**Plugin environment.** `StackSpec.Env` (plus `Options.Env` per operation)
+is the environment every provider plugin and language host launched by the
+operation gets, overlaid on the process environment. Per-run credentials,
+`PULUMI_HOME` for the plugins' own use, `NODE_PATH`, program variables: all
+go here, and never into this process, so concurrent operations with
+different environments do not interfere. The library's own plugin cache and
+downloads still use the process's `PULUMI_HOME`/`GITHUB_TOKEN` (upstream.md
+#9).
+
+**Tags, listing, history.** `Stack.GetTags/SetTags` (both backends; the DIY
+backend keeps a `<stack>.pulumi-tags` file beside the checkpoint since
+Pulumi 3.2xx, with one limit documented on `SetTags`), `engine.ListStacks`
+(project/organization/tag filters; `Organization` is `Unsupported` on DIY),
+`Stack.History` (newest first, paged; the DIY backend reads its
+`.pulumi/history` files and has no version numbers). Anything a backend
+cannot do is a typed `Unsupported` error, never a panic.
+
 ## Events and errors
 
 `Event` embeds Pulumi's wire type `apitype.EngineEvent` (the `--json` /
 event-log format) and adds `Type` (`prelude`, `summary`, `resourcePre`,
 `resourceOutputs`, `resourceOpFailed`, `diagnostic`, `stdout`, `policy*`,
 `progress`, ...). Property values are secret-redacted (`[secret]`) unless
-`Options.ShowSecrets` is set. The engine's terminating `cancel` event is
-consumed by the library; the closed channel is the terminator.
+`Options.ShowSecrets` is set. Every event carries `sequence` (from 0 per
+operation) and `timestamp` (Unix seconds), and every stream ends with the
+engine's `cancel` event after the summary, exactly as `pulumi --event-log`
+and the Automation API deliver it; it is the terminator, not a sign that
+anything was cancelled. The backend's `Updating (dev):` banner arrives as a
+`stdout` event (see "Stdout" below).
 
 Typed errors (`errors.As` / `engine.KindOf` / `error.kind` over the ABI):
 `InvalidSpec{Field}`, `ResourceOpFailed{URN,Type,Op,Provider,Message}`
 (all failures are in `Result.Failures`), `ProgramFailed{Message}`,
 `ConcurrentUpdate`, `StackNotFound`, `StackExists`, `PendingOperations{URNs}`,
-`Cancelled{Operation}`, `Unclassified{Err}`.
+`Cancelled{Operation}`, `Unsupported{Feature,Backend}`, `Unclassified{Err}`.
 
 ## How it drives Pulumi
 
@@ -189,20 +221,53 @@ that wires `Operation.Cancel`/context cancellation to the engine's
 `cancel.Context`. The backend itself runs under `context.WithoutCancel` so the
 checkpoint write after a cancel is never interrupted.
 
-Copied from pulumi/pulumi (Apache-2.0, attributed in place):
-`engine/langserver.go` is the unexported in-process LanguageRuntime server
-from `sdk/v3/go/auto/stack.go`, so that the `auto` package (which shells out
-to the CLI) is not a dependency. Nothing reaches into `internal` packages.
+Each operation runs with its own `plugin.Host` (`engine/pluginhost.go`),
+passed through `engine.UpdateOptions.Host`: Pulumi's default host on a
+`plugin.Context` of the operation's own, with provider launches given
+`StackSpec.Env` through the `env.Env` parameter `Host.Provider` already has,
+and language hosts launched by the library (Pulumi launches those with a nil
+env). The host's diag sinks feed the operation's event stream, so plugin
+output and `pulumi.log` calls arrive as diagnostics as they do from the CLI.
+
+Copied from pulumi/pulumi (Apache-2.0): everything lives under
+[`internal/upstream/`](internal/upstream), one file per copied unit with a
+header naming the upstream file, version and sha256, and begin/end markers
+around the copied region. `make upstream-check` fails with a diff when any of
+those upstream files changed at the pinned version. Nothing else reaches into
+behaviour a public Pulumi API could provide; the hooks we wish existed are in
+[docs/upstream.md](docs/upstream.md).
 
 ## Compatibility surface and bump policy
 
-`github.com/pulumi/pulumi/pkg/v3` and `sdk/v3` are pinned at **v3.237.0**.
-**These packages are not a stable API.** `pkg/v3` in particular is the CLI's
+| what | version |
+|-|-|
+| `github.com/pulumi/pulumi/pkg/v3`, `sdk/v3` | **v3.237.0** (go.mod) |
+| `pulumi` CLI versions the parity suite was verified against | 3.218.0, 3.237.0 (CI, `PULUMI_CLI_VERSION`), 3.250.0 |
+| `@pulumi/pulumi` Node SDK the binding is tested with | 3.261.0 (`bindings/nodejs/pnpm-lock.yaml`; peer range `>=3.150.0`) |
+| language hosts / providers in tests | `pulumi-language-yaml` 1.38.5 (pinned when installed by the tests), `pulumi-random` 4.16.8, `pulumi-command` latest |
+| event schema | `apitype.EngineEvent` of the pinned sdk (the `--event-log` / Automation API JSON); deployment schema v3 (`apitype.DeploymentSchemaVersionCurrent`); service API `application/vnd.pulumi+9` |
+
+**These packages are not a stable API.** `pkg/v3` is the CLI's
 implementation, and Pulumi changes signatures (`backend.UpdateOperation`,
 `engine.UpdateOptions`, display options, secrets constructors) between minor
-releases. Every bump is a compatibility event for this repository: run the
-unit and integration suites, re-record the event fixtures, re-read the
-`operations/*.go` files for changed flags, and expect to touch this library.
+releases. Every bump is a compatibility event, made cheap by three things:
+
+- **One fork boundary.** All copied Pulumi code is under `internal/upstream/`
+  with a header per file (upstream path, pinned version, sha256, why it is
+  copied, what would let us delete it).
+- **Drift check.** `make upstream-check` (also run by `make test` and CI)
+  recomputes the sha256 of every upstream file a copy came from at the
+  version pinned in go.mod and fails with a unified diff between the recorded
+  and the pinned version when it changed; after review and porting,
+  `make upstream-update` accepts the new version.
+- **Bump workflow.** `make bump PULUMI=vX.Y.Z` (`scripts/bump-pulumi.sh`)
+  bumps pkg+sdk together, tidies, builds, runs the unit tests and the drift
+  check, keeps CI's parity CLI version and this table in step, and prints the
+  integration/parity/Node commands to run next. A weekly GitHub Actions job
+  (`upstream-weekly.yml`) does the same against the latest `pkg/v3` release on
+  a throwaway branch and opens or updates an issue with the result; nothing is
+  merged automatically.
+
 Provider plugins and language hosts are versioned independently and are not
 affected by the pin. The test-only `pulumi-random` Go SDK is pinned at
 v4.16.8 because newer releases require a newer `sdk/v3`.
@@ -224,6 +289,9 @@ built library (`make abitest`).
 | `pulumi_op_wait(op, &err)` | result JSON, or `NULL` with error JSON (`kind`, fields, partial `result`) |
 | `pulumi_op_release(op)` | forget the op id |
 | `pulumi_stack_export/import/outputs/set_config/get_config/remove/cancel/close` | as named |
+| `pulumi_stack_get_tags/set_tags(handle, tags_json)` | tags as a JSON object; set replaces all |
+| `pulumi_stack_history(handle, options_json)` | `[{kind, result, message, startTime, endTime, version, environment, config, resourceChanges}]`, newest first; options `{limit, page, showSecrets}` |
+| `pulumi_list_stacks(request_json)` | `{"backend": {...}, "filter": {project, organization, tagName, tagValue}}` -> `[{name, fullName, project, lastUpdate, resourceCount}]` |
 | `pulumi_free(p)` | release any string the library returned |
 
 Memory contract: every `char*` the library returns is owned by the caller and
@@ -244,13 +312,27 @@ loopback gRPC.
 - **Stdout.** The backends print one header line per operation
   (`Updating (dev):`) with `fmt.Printf` to the process stdout, unconditionally
   unless JSON display (which prints every event to stdout) or watch display
-  (worse) is selected. There is no `Display.Stdout` route for that line in
-  v3.237.0. Expect that line; a one-line upstream fix would remove it.
-- **HTTP backend tokens.** `httpstate.New` reads the token from
-  `~/.pulumi/credentials.json` (or `PULUMI_CREDENTIALS_PATH`); there is no
-  constructor that accepts one. `BackendSpec.Token` is therefore stored into
-  that file for the backend URL (the "current" backend entry is left alone)
-  before the backend is opened. Not per-process, and documented as such.
+  (worse) is selected; there is no `Display.Stdout` route in v3.237.0. The
+  first operation therefore replaces the Go runtime's `os.Stdout` with a pipe
+  (`engine/stdout.go`): banner lines of running operations become their
+  `stdout` events, everything else is forwarded to the original stdout. For
+  the shared library that is all of the library's output and the host
+  process's file descriptor 1 is untouched; a Go program embedding the
+  package keeps its own prints (through the forwarding hop) and can opt out
+  with `engine.SetStdoutCapture(false)` before the first operation.
+- **HTTP backend tokens.** `httpstate.New` reads the token from Pulumi's
+  credentials file and nothing else; the backend type is unexported. See
+  "Backends, secrets, credentials" for the per-spec hand-off.
+- **Plugin environment.** `Host.Provider` takes an env, `NewLanguageRuntime`
+  does not, and a caller-supplied host cannot sit on the engine's plugin
+  context (whose diag sink is unexported). Hence the per-operation host on
+  its own context with a copied event sink, and a copied plugin launcher for
+  language hosts (`internal/upstream/{eventsink,launch}.go`).
+- **Passphrase cache.** `passphrase.GetPassphraseSecretsManager` caches
+  managers process-wide by salt and ignores the passphrase on a hit; the
+  library verifies the passphrase first (`internal/upstream/passphrase.go`),
+  otherwise a wrong passphrase would be accepted after a right one in the
+  same process.
 - **Same-process lock detection.** Pulumi's DIY lock only detects locks held
   by *other* backend instances (lock ids are per instance). Two operations on
   one `Stack` handle would race, so the handle serialises them and returns
@@ -286,11 +368,12 @@ loopback gRPC.
 
 ## Not modelled (yet)
 
-- Per-stack environment for plugin subprocesses: Pulumi's plugin launcher
-  inherits the process environment and has no injection point, so provider
-  and language-host env is process-global.
+- Per-stack `PULUMI_HOME` for the library's own plugin resolution and
+  downloads (and `GITHUB_TOKEN` for them): `workspace.GetPluginPath` reads
+  the process environment; the spec's `PULUMI_HOME` reaches plugin
+  subprocesses only ([docs/upstream.md](docs/upstream.md) #9).
 - Policy packs, update plans (`--plan`), `--target-replace` beyond the
-  `Targets`/`Replaces` options, import operations, stack rename/history,
+  `Targets`/`Replaces` options, import operations, stack rename,
   ESC environments, remote (Pulumi Deployments) operations.
 - Windows.
 
@@ -302,7 +385,11 @@ loopback gRPC.
 - Policy packs (`LocalPolicyPacks`/`RequiredPolicies` are already on the
   engine options).
 - Update plans: generate on preview, constrain on up.
-- Upstream the executor fix and a `Display.Stdout` route for the header line.
+- Upstream the asks in [docs/upstream.md](docs/upstream.md) (language-host
+  env, a host factory on the engine's context, `httpstate.NewWithAccount`, a
+  `Display.Stdout` route for the banner, the executor fix) and delete the
+  copies they replace.
+- Per-spec `PULUMI_HOME` for plugin resolution (blocked on upstream.md #9).
 - Python/Node local-program runtime options (`nodeargs`, virtualenv) on
   `LocalProgram`.
 
@@ -317,6 +404,8 @@ make lib           # build/libpulumi.{dylib,so} + header
 make abitest       # cgo test linking the built library
 make node          # copy the lib into the binding, tsc, node --test
 make lint          # golangci-lint if installed, else go vet
+make upstream-check   # drift check of internal/upstream against the pinned Pulumi modules
+make bump PULUMI=vX.Y.Z   # bump the Pulumi pin (scripts/bump-pulumi.sh)
 ```
 
 Recording event fixtures: `PULUMI_ENGINE_RECORD_DIR=$PWD/engine/testdata/events make integration`.
@@ -332,7 +421,11 @@ linux/amd64) with the ABI test, and the Node binding on both platforms.
 - Branch work happens directly in the checkout (no git worktree) because the
   repository had no history to conflict with.
 - `Create` on `StackSpec` is opt-in; a missing stack is `StackNotFound`.
-- Passphrase must be non-empty; there is no prompting and no env fallback.
+- The passphrase is a spec field; there is no prompting and no env fallback.
+  The empty passphrase is accepted when confirmed (`PassphraseSet`, or the
+  JSON key being present), as the CLI accepts `PULUMI_CONFIG_PASSPHRASE=""`.
+- `StackSpec.Env` is for subprocesses only; the library never calls
+  `os.Setenv`.
 - `Options.Parallel` 0 means unlimited, matching the CLI default.
 - Operations from one handle are serialised (see above); `Stack.Cancel`
   cancels them all and asks the backend to cancel where supported.

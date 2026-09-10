@@ -25,11 +25,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/backend/diy"
 	"github.com/pulumi/pulumi/pkg/v3/backend/httpstate"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
+	"github.com/pulumi/pulumi/pkg/v3/util/validation"
+	pkgws "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
@@ -121,7 +124,7 @@ func Open(ctx context.Context, spec StackSpec) (*Stack, error) {
 		stack:    bs,
 		project:  project,
 		root:     root,
-		provider: specSecretsProvider{passphrase: spec.Secrets.Passphrase},
+		provider: specSecretsProvider{passphrase: spec.Secrets.Passphrase, hasPassphrase: spec.Secrets.hasPassphrase()},
 		running:  map[*Operation]struct{}{},
 	}
 
@@ -155,29 +158,81 @@ func openBackend(ctx context.Context, sink diag.Sink, spec StackSpec, project *w
 		}
 		return be, nil
 	}
-	if spec.Backend.Token != "" {
-		// Pulumi's HTTP backend has no constructor that accepts a token; it
-		// reads ~/.pulumi/credentials.json (or PULUMI_CREDENTIALS_PATH). The
-		// only way to hand it a token is to store one for this URL. We never
-		// change the "current" backend recorded there.
-		existing, err := workspace.GetAccount(spec.Backend.URL)
-		if err != nil {
-			return nil, Unclassified{Err: fmt.Errorf("reading stored credentials: %w", err)}
-		}
-		if existing.AccessToken != spec.Backend.Token {
-			if err := workspace.StoreAccount(spec.Backend.URL, workspace.Account{
-				AccessToken: spec.Backend.Token,
-				Insecure:    spec.Backend.Insecure,
-			}, false); err != nil {
-				return nil, Unclassified{Err: fmt.Errorf("storing credentials: %w", err)}
-			}
-		}
-	}
-	be, err := httpstate.New(ctx, sink, spec.Backend.URL, project, spec.Backend.Insecure)
+	var be backend.Backend
+	err := withSpecCredentials(spec.Backend, func() error {
+		var err error
+		be, err = httpstate.New(ctx, sink, spec.Backend.URL, project, spec.Backend.Insecure)
+		return err
+	})
 	if err != nil {
 		return nil, Unclassified{Err: fmt.Errorf("opening backend %s: %w", spec.Backend.URL, err)}
 	}
 	return be, nil
+}
+
+// credentialsMu serialises the credential hand-off below across the process.
+var credentialsMu sync.Mutex
+
+// withSpecCredentials runs open, which constructs an HTTP backend, with the
+// spec's token visible to it and nothing else.
+//
+// Pulumi's HTTP backend has no constructor that takes a token: httpstate.New
+// reads workspace.GetAccount(url), which is the credentials file at
+// PULUMI_CREDENTIALS_PATH or $PULUMI_HOME/credentials.json, and keeps the
+// token it finds there in the backend instance's own client. The library
+// therefore hands the token over through that file for the duration of the
+// constructor only: under a process-wide lock it records the file's previous
+// content, stores the spec's account for the URL, constructs the backend,
+// and restores the file exactly (deleting it when it did not exist). The
+// backend instance keeps the spec's token; concurrent Open calls with
+// different tokens for one URL each get their own. PULUMI_ACCESS_TOKEN is
+// never consulted (httpstate.New does not read it). What remains process
+// global is the location of the hand-off file; see docs/upstream.md.
+func withSpecCredentials(spec BackendSpec, open func() error) error {
+	if spec.Token == "" {
+		// No token: the stored credentials (a `pulumi login`) apply, as
+		// they would for the CLI.
+		return open()
+	}
+	credentialsMu.Lock()
+	defer credentialsMu.Unlock()
+	url := httpstate.ValueOrDefaultURL(pkgws.Instance, spec.URL)
+	path := credentialsFilePath()
+	before, readErr := os.ReadFile(path)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return fmt.Errorf("reading stored credentials: %w", readErr)
+	}
+	if err := workspace.StoreAccount(url, workspace.Account{
+		AccessToken: spec.Token,
+		Insecure:    spec.Insecure,
+	}, false); err != nil {
+		return fmt.Errorf("storing credentials for the backend constructor: %w", err)
+	}
+	openErr := open()
+	var restoreErr error
+	if readErr != nil {
+		restoreErr = os.Remove(path)
+	} else {
+		restoreErr = os.WriteFile(path, before, 0o600)
+	}
+	if restoreErr != nil {
+		return errors.Join(openErr, fmt.Errorf("restoring stored credentials: %w", restoreErr))
+	}
+	return openErr
+}
+
+// credentialsFilePath is where Pulumi keeps credentials.json:
+// $PULUMI_CREDENTIALS_PATH, else $PULUMI_HOME (or ~/.pulumi). Pulumi's own
+// resolution is unexported (sdk workspace/creds.go getCredsFilePath).
+func credentialsFilePath() string {
+	if dir := os.Getenv(workspace.PulumiCredentialsPathEnvVar); dir != "" {
+		return filepath.Join(dir, "credentials.json")
+	}
+	home, err := workspace.GetPulumiHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "credentials.json")
+	}
+	return filepath.Join(home, "credentials.json")
 }
 
 // Spec returns a copy of the spec the stack was opened with (with defaults
@@ -500,4 +555,248 @@ func (s *Stack) pendingOperationURNs(ctx context.Context) []string {
 		urns = append(urns, string(op.Resource.URN))
 	}
 	return urns
+}
+
+// Tags, listing and history.
+
+// backendScheme names the backend family for Unsupported errors.
+func backendScheme(url string) string {
+	if isDIYBackend(url) {
+		return "diy"
+	}
+	return "http"
+}
+
+// GetTags returns the stack's tags.
+//
+// HTTP backends store tags in the service. The DIY backend (Pulumi v3.237.0)
+// stores them in a "<stack>.pulumi-tags" JSON file beside the checkpoint,
+// which a CLI of the same or a newer version reads (`pulumi stack tag ls`).
+func (s *Stack) GetTags(ctx context.Context) (map[string]string, error) {
+	bs, err := s.freshStack(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for k, v := range bs.Tags() {
+		out[k] = v
+	}
+	return out, nil
+}
+
+// SetTags replaces the stack's tags with tags (an empty map removes all of
+// them). Tag names and values are validated as the service does (name up to
+// 40 characters of [a-zA-Z0-9-_.:], value up to 256 characters).
+//
+// DIY limit (Pulumi v3.237.0): the backend skips the write when the new map
+// is empty, so removing the last tag clears it for this handle but leaves
+// the tags file as it was for other readers. Set at least one tag, or
+// remove the stack, to get rid of the file.
+func (s *Stack) SetTags(ctx context.Context, tags map[string]string) error {
+	bs, err := s.freshStack(ctx)
+	if err != nil {
+		return err
+	}
+	if tags == nil {
+		tags = map[string]string{}
+	}
+	if err := validation.ValidateStackTags(tags); err != nil {
+		return InvalidSpec{Field: "tags", Message: err.Error()}
+	}
+	if err := backend.UpdateStackTags(ctx, bs, tags); err != nil {
+		return classifyBackendError(s.spec.Name, err)
+	}
+	s.mu.Lock()
+	s.stack = bs
+	s.mu.Unlock()
+	return nil
+}
+
+// StackSummary is one entry of a stack listing.
+type StackSummary struct {
+	// Name is the stack reference as the backend renders it for a listing:
+	// the organization and project are elided when they are the ones the
+	// listing was filtered by ("dev"), as `pulumi stack ls` prints them.
+	Name string `json:"name"`
+	// FullName is the fully qualified reference ("org/project/dev";
+	// "organization/project/dev" on DIY backends).
+	FullName string `json:"fullName"`
+	// Project is the project the stack belongs to, when the backend knows it.
+	Project string `json:"project,omitempty"`
+	// LastUpdate is the time of the last update, when the backend knows it.
+	LastUpdate *time.Time `json:"lastUpdate,omitempty"`
+	// ResourceCount is the number of resources in the checkpoint, when known.
+	ResourceCount *int `json:"resourceCount,omitempty"`
+}
+
+// ListFilter narrows a stack listing.
+type ListFilter struct {
+	// Project restricts the listing to one project. On DIY backends this
+	// works for the project-scoped state layout (the default since Pulumi
+	// 3.x, where checkpoints live under .pulumi/stacks/<project>/); a legacy
+	// layout has no project per stack and the filter is a no-op.
+	Project string `json:"project,omitempty"`
+	// Organization restricts the listing to one organization (HTTP backends
+	// only; Unsupported on DIY backends).
+	Organization string `json:"organization,omitempty"`
+	// TagName/TagValue restrict the listing to stacks carrying the tag.
+	TagName  string `json:"tagName,omitempty"`
+	TagValue string `json:"tagValue,omitempty"`
+}
+
+// ListStacks lists the stacks a backend holds, following continuation
+// tokens until the listing is complete.
+func ListStacks(ctx context.Context, spec BackendSpec, filter ListFilter) ([]StackSummary, error) {
+	stackSpec := StackSpec{Name: "list", Project: ProjectSpec{Name: "list"}, Backend: spec, Secrets: SecretsSpec{Provider: secretsB64}}
+	if err := stackSpec.validate(); err != nil {
+		return nil, err
+	}
+	if filter.Organization != "" && isDIYBackend(spec.URL) {
+		return nil, Unsupported{Feature: "listStacks.organization", Backend: "diy",
+			Message: "DIY backends have no organizations"}
+	}
+	sink := diag.DefaultSink(io.Discard, io.Discard, diag.FormatOptions{Color: colors.Never})
+	var project *workspace.Project
+	if filter.Project != "" {
+		if _, err := tokens.ParseStackName(filter.Project); err != nil {
+			return nil, InvalidSpec{Field: "filter.project", Message: err.Error()}
+		}
+		project = &workspace.Project{
+			Name:    tokens.PackageName(filter.Project),
+			Runtime: workspace.NewProjectRuntimeInfo(clientRuntimeName, nil),
+		}
+	}
+	be, err := openBackend(ctx, sink, stackSpec, project)
+	if err != nil {
+		return nil, err
+	}
+	f := backend.ListStacksFilter{}
+	if filter.Project != "" {
+		f.Project = &filter.Project
+	}
+	if filter.Organization != "" {
+		f.Organization = &filter.Organization
+	}
+	if filter.TagName != "" {
+		f.TagName = &filter.TagName
+	}
+	if filter.TagValue != "" {
+		f.TagValue = &filter.TagValue
+	}
+	out := []StackSummary{}
+	var token backend.ContinuationToken
+	for {
+		summaries, next, err := be.ListStacks(ctx, f, token)
+		if err != nil {
+			return nil, classifyBackendError("", err)
+		}
+		for _, sum := range summaries {
+			entry := StackSummary{
+				Name:          sum.Name().String(),
+				FullName:      string(sum.Name().FullyQualifiedName()),
+				LastUpdate:    sum.LastUpdate(),
+				ResourceCount: sum.ResourceCount(),
+			}
+			if p, ok := sum.Name().Project(); ok {
+				entry.Project = string(p)
+			}
+			out = append(out, entry)
+		}
+		if next == nil {
+			break
+		}
+		token = next
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FullName < out[j].FullName })
+	return out, nil
+}
+
+// UpdateInfo is one entry of a stack's update history.
+type UpdateInfo struct {
+	// Kind is the update kind ("update", "preview", "refresh", "destroy", ...).
+	Kind string `json:"kind"`
+	// Result is "succeeded", "failed", "in-progress" or "not-started".
+	Result string `json:"result"`
+	// Message is the message the update was started with.
+	Message string `json:"message"`
+	// StartTime and EndTime are Unix seconds.
+	StartTime int64 `json:"startTime"`
+	EndTime   int64 `json:"endTime"`
+	// Version is the update's sequence number on HTTP backends; the DIY
+	// backend does not number updates and reports 0.
+	Version int `json:"version"`
+	// Environment is the metadata recorded with the update ("exec.kind", vcs tags).
+	Environment map[string]string `json:"environment"`
+	// Config is the configuration the update ran with. Secret values are the
+	// stored ciphertext unless the history was requested with showSecrets.
+	Config map[string]ConfigValue `json:"config"`
+	// ResourceChanges counts resource operations by kind.
+	ResourceChanges map[string]int `json:"resourceChanges,omitempty"`
+}
+
+// HistoryOptions tunes History.
+type HistoryOptions struct {
+	// Limit is the maximum number of entries (0: every entry the backend
+	// returns; the DIY backend returns all, an HTTP backend its default page).
+	Limit int `json:"limit,omitempty"`
+	// Page selects a page of Limit entries, from 1.
+	Page int `json:"page,omitempty"`
+	// ShowSecrets decrypts secret config values with the stack's secrets manager.
+	ShowSecrets bool `json:"showSecrets,omitempty"`
+}
+
+// History returns the stack's updates, newest first.
+//
+// The DIY backend keeps one "<stack>-<time>.history.json" file per update
+// under .pulumi/history/ and pages through them locally; HTTP backends page
+// on the server. Previews are not recorded on either.
+func (s *Stack) History(ctx context.Context, opts HistoryOptions) ([]UpdateInfo, error) {
+	page := opts.Page
+	if page < 1 {
+		page = 1
+	}
+	updates, err := s.backend.GetHistory(ctx, s.stack.Ref(), opts.Limit, page)
+	if err != nil {
+		return nil, classifyBackendError(s.spec.Name, err)
+	}
+	s.mu.Lock()
+	sm := s.sm
+	s.mu.Unlock()
+	out := make([]UpdateInfo, 0, len(updates))
+	for _, u := range updates {
+		info := UpdateInfo{
+			Kind:        string(u.Kind),
+			Result:      string(u.Result),
+			Message:     u.Message,
+			StartTime:   u.StartTime,
+			EndTime:     u.EndTime,
+			Version:     u.Version,
+			Environment: map[string]string{},
+			Config:      map[string]ConfigValue{},
+		}
+		for k, v := range u.Environment {
+			info.Environment[k] = v
+		}
+		for k, v := range u.Config {
+			cv := ConfigValue{Secret: v.Secure(), Object: v.Object()}
+			if v.Secure() && opts.ShowSecrets {
+				plain, err := v.Value(sm.Decrypter())
+				if err != nil {
+					return nil, Unclassified{Err: fmt.Errorf("decrypting history config %s: %w", k, err)}
+				}
+				cv.Value = plain
+			} else {
+				cv.Value, _ = v.Value(config.NopDecrypter)
+			}
+			info.Config[k.String()] = cv
+		}
+		if len(u.ResourceChanges) > 0 {
+			info.ResourceChanges = map[string]int{}
+			for op, n := range u.ResourceChanges {
+				info.ResourceChanges[string(op)] = n
+			}
+		}
+		out = append(out, info)
+	}
+	return out, nil
 }

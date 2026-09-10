@@ -7,6 +7,9 @@
 #   make lib          build libpulumi.{dylib,so} + header for the host platform into build/
 #   make node         install, build and test the Node binding against build/libpulumi.*
 #   make lint         golangci-lint if installed, otherwise go vet
+#   make upstream-check  diff the copied Pulumi code under internal/upstream against the pinned module
+#   make upstream-update accept the pinned version in the copied files' headers (after review)
+#   make bump PULUMI=vX.Y.Z  bump pkg/v3 + sdk/v3, tidy, unit tests, drift check (scripts/bump-pulumi.sh)
 
 GO      ?= go
 BUILD   ?= build
@@ -25,7 +28,7 @@ endif
 LIB      := $(BUILD)/libpulumi.$(LIB_EXT)
 HEADER   := $(BUILD)/libpulumi.h
 
-.PHONY: build test integration parity lib abitest node node-install node-build lint clean
+.PHONY: build test integration parity lib abitest node node-install node-build lint clean upstream-check upstream-update bump
 
 build:
 	$(GO) build ./...
@@ -67,6 +70,19 @@ node-build: lib node-install
 
 node: node-build
 	cd bindings/nodejs && pnpm test
+
+# Drift check of the fork boundary (internal/upstream): fails with a unified
+# diff when an upstream file a copy was taken from changed at the pinned version.
+upstream-check:
+	$(GO) run ./internal/upstream/cmd/upstreamcheck
+
+upstream-update:
+	$(GO) run ./internal/upstream/cmd/upstreamcheck -update
+
+# Bump the Pulumi pin: make bump PULUMI=v3.240.0
+bump:
+	@test -n "$(PULUMI)" || { echo "usage: make bump PULUMI=vX.Y.Z"; exit 2; }
+	./scripts/bump-pulumi.sh $(PULUMI)
 
 lint:
 	@if command -v golangci-lint >/dev/null 2>&1; then golangci-lint run ./...; else echo "golangci-lint not installed; running go vet"; $(GO) vet ./...; fi

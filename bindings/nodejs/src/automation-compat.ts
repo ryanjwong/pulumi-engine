@@ -32,6 +32,12 @@
  * StackNotFoundError` / `ConcurrentUpdateError` / `CommandError` checks hold.
  * Without an SDK, structurally identical classes exported from this module
  * are used. Either way the library's typed `PulumiError` rides on `cause`.
+ *
+ * The library supplies what the facade used to synthesise: engine events
+ * carry their own `sequence`/`timestamp` and the stream's closing
+ * `cancelEvent`, `history`/`info` read the backend's update history, tags go
+ * through the backend, `listStacks` works on every backend, and the
+ * workspace's `envVars` reach plugins and language hosts as `StackSpec.env`.
  */
 
 import * as fs from "node:fs";
@@ -45,6 +51,8 @@ import {
     Secret,
     StackExistsError,
     StackNotFoundError as EngineStackNotFoundError,
+    UnsupportedError,
+    listStacks as libraryListStacks,
     openStack,
     version as libraryVersion,
     type ConfigValue as EngineConfigValue,
@@ -55,6 +63,7 @@ import {
     type Result as EngineResult,
     type Stack as EngineStack,
     type StackSpec,
+    type UpdateInfo as EngineUpdateInfo,
 } from "./index";
 import { libraryPath } from "./native";
 
@@ -730,6 +739,9 @@ function engineOptions(opts: GlobalOpts & Record<string, unknown>, dryRun: boole
     if (dryRun) {
         out.dryRun = true;
     }
+    if (opts.env && typeof opts.env === "object") {
+        out.env = opts.env as Record<string, string>;
+    }
     if (opts.signal) {
         out.signal = opts.signal;
     }
@@ -754,6 +766,28 @@ function outputMap(outputs: EngineResult["outputs"] | { values: Record<string, u
     return out;
 }
 
+const updateKinds = new Set<string>(["update", "preview", "refresh", "rename", "destroy", "import"]);
+const updateResults = new Set<string>(["not-started", "in-progress", "succeeded", "failed"]);
+
+/** The SDK's `UpdateSummary` from the library's `UpdateInfo`. */
+function updateSummary(info: EngineUpdateInfo): UpdateSummary {
+    const config: ConfigMap = {};
+    for (const [k, v] of Object.entries(info.config ?? {})) {
+        config[k] = { value: v.value, secret: v.secret === true };
+    }
+    return {
+        kind: (updateKinds.has(info.kind) ? info.kind : "update") as UpdateKind,
+        result: (updateResults.has(info.result) ? info.result : "succeeded") as UpdateResult,
+        message: info.message ?? "",
+        startTime: new Date(info.startTime * 1000),
+        endTime: new Date(info.endTime * 1000),
+        version: info.version ?? 0,
+        environment: info.environment ?? {},
+        config,
+        ...(info.resourceChanges ? { resourceChanges: info.resourceChanges as OpMap } : {}),
+    };
+}
+
 interface OperationOutcome {
     stdout: string;
     stderr: string;
@@ -765,18 +799,12 @@ interface OperationOutcome {
 
 // ── Workspace ────────────────────────────────────────────────────────────────
 
-interface StackHistory {
-    entries: UpdateSummary[];
-}
-
 /**
  * Internal state shared by a workspace and the stacks opened through it:
- * one engine handle per stack name, plus the per-stack history the library
- * does not keep.
+ * one engine handle per stack name. Update history lives in the backend.
  */
 class WorkspaceState {
     readonly handles = new Map<string, EngineStack>();
-    readonly histories = new Map<string, StackHistory>();
 }
 
 /**
@@ -945,9 +973,12 @@ export class LocalWorkspace {
         const secrets: StackSpec["secrets"] = { provider };
         if (provider === "passphrase") {
             const passphrase = this.passphrase();
-            if (passphrase === undefined || passphrase === "") {
+            // `PULUMI_CONFIG_PASSPHRASE=""` is a valid CLI passphrase, and the
+            // library takes the key's presence as the confirmation; only an
+            // unset passphrase (no env var, no _FILE) is an error.
+            if (passphrase === undefined) {
                 throw new Error(
-                    "the passphrase secrets provider needs a non-empty PULUMI_CONFIG_PASSPHRASE " +
+                    "the passphrase secrets provider needs PULUMI_CONFIG_PASSPHRASE " +
                         "(or PULUMI_CONFIG_PASSPHRASE_FILE) in the workspace's envVars or the process environment",
                 );
             }
@@ -964,12 +995,20 @@ export class LocalWorkspace {
             }
         }
         const token = this.env("PULUMI_ACCESS_TOKEN");
+        // The SDK hands `envVars` to the `pulumi` process, whose plugins and
+        // language hosts inherit them; the library takes the same map as the
+        // stack's plugin environment (it never touches this process's env).
+        const env: Record<string, string> = { ...this.envVars };
+        if (this.pulumiHome && env.PULUMI_HOME === undefined) {
+            env.PULUMI_HOME = this.pulumiHome;
+        }
         return {
             name: stackName,
             project: { name: settings.name, dir: this.workDir, description: settings.description },
             backend: { url: backendUrl, ...(token && !isDIYBackend(backendUrl) ? { token } : {}) },
             secrets,
             ...(Object.keys(config).length > 0 ? { config } : {}),
+            ...(Object.keys(env).length > 0 ? { env } : {}),
             create,
         };
     }
@@ -993,6 +1032,9 @@ export class LocalWorkspace {
         }
         if (error instanceof EngineConcurrentUpdateError) {
             return this.commandError(stdout, `${stderr}error: ${conflictText}\n${error.message}\n`, 255, error);
+        }
+        if (error instanceof UnsupportedError) {
+            return this.commandError(stdout, `${stderr}error: ${error.message}\n`, 255, error);
         }
         if (error instanceof CancelledError) {
             const what = /preview/i.test(error.operation) ? "preview" : "update";
@@ -1022,16 +1064,6 @@ export class LocalWorkspace {
         this.state.handles.set(stackName, handle);
         this.currentStack = stackName;
         return handle;
-    }
-
-    /** @internal */
-    history(stackName: string): StackHistory {
-        let h = this.state.histories.get(stackName);
-        if (!h) {
-            h = { entries: [] };
-            this.state.histories.set(stackName, h);
-        }
-        return h;
     }
 
     // ── The SDK's Workspace stack methods ──
@@ -1069,32 +1101,35 @@ export class LocalWorkspace {
         }
         handle.close();
         this.state.handles.delete(stackName);
-        this.state.histories.delete(stackName);
         if (this.currentStack === stackName) {
             this.currentStack = undefined;
         }
     }
 
     /**
-     * The library has no stack listing; for `file://` backends the state
-     * directory is read directly. Other backends reject.
+     * The stacks of this workspace's backend, from the library's listing
+     * (every backend, not just `file://`). `name` is the elided reference
+     * `pulumi stack ls` prints.
      */
     async listStacks(_opts?: ListOptions): Promise<StackSummary[]> {
         const url = this.backendUrl();
-        if (!url.startsWith("file://")) {
-            throw new Error(`listStacks is only supported on file:// backends by the in-process engine (backend ${url})`);
+        const token = this.env("PULUMI_ACCESS_TOKEN");
+        const project = readProjectSettings(this.workDir)?.name;
+        let listed;
+        try {
+            listed = libraryListStacks(
+                { url, ...(token && !isDIYBackend(url) ? { token } : {}) },
+                project ? { project } : {},
+            );
+        } catch (error) {
+            throw this.translate(error, this.currentStack ?? "");
         }
-        const settings = await this.projectSettings();
-        const root = url === "file://~" ? os.homedir() : decodeURIComponent(url.slice("file://".length));
-        const dir = path.join(root, ".pulumi", "stacks", settings.name);
-        if (!fs.existsSync(dir)) {
-            return [];
-        }
-        return fs
-            .readdirSync(dir)
-            .filter((f) => f.endsWith(".json"))
-            .map((f) => f.slice(0, -".json".length))
-            .map((name) => ({ name, current: name === this.currentStack }));
+        return listed.map((s) => ({
+            name: s.name,
+            current: s.name === this.currentStack || s.fullName === this.currentStack,
+            ...(s.lastUpdate ? { lastUpdate: new Date(s.lastUpdate).toISOString() } : {}),
+            ...(s.resourceCount !== undefined ? { resourceCount: s.resourceCount } : {}),
+        }));
     }
 
     async stack(): Promise<StackSummary | undefined> {
@@ -1251,7 +1286,7 @@ export class Stack {
     async up(opts: UpOptions = {}): Promise<UpResult> {
         this.rejectPlan(opts, "up");
         const outcome = await this.run("up", this.program(opts, true), opts, false);
-        const summary = this.record("update", outcome, opts.message);
+        const summary = await this.latestSummary("update", outcome, opts.message);
         // The SDK's UpResult.outputs shows secret values (`stack output --show-secrets`).
         const outputs = await this.workspace.stackOutputs(this.name);
         return { stdout: outcome.stdout, stderr: outcome.stderr, summary, outputs };
@@ -1266,14 +1301,14 @@ export class Stack {
     async refresh(opts: RefreshOptions = {}): Promise<RefreshResult> {
         const dryRun = opts.previewOnly === true;
         const outcome = await this.run("refresh", this.program(opts, false), opts, dryRun);
-        const summary = this.record("refresh", outcome, opts.message);
+        const summary = await this.latestSummary("refresh", outcome, opts.message, !dryRun);
         return { stdout: outcome.stdout, stderr: outcome.stderr, summary };
     }
 
     async destroy(opts: DestroyOptions = {}): Promise<DestroyResult> {
         const dryRun = opts.previewOnly === true;
         const outcome = await this.run("destroy", this.program(opts, false), opts, dryRun);
-        const summary = this.record("destroy", outcome, opts.message);
+        const summary = await this.latestSummary("destroy", outcome, opts.message, !dryRun);
         return { stdout: outcome.stdout, stderr: outcome.stderr, summary };
     }
 
@@ -1282,9 +1317,22 @@ export class Stack {
         return { stdout: outcome.stdout, stderr: outcome.stderr, changeSummary: outcome.summary?.resourceChanges ?? {} };
     }
 
-    private record(kind: UpdateKind, outcome: OperationOutcome, message: string | undefined): UpdateSummary {
-        const history = this.workspace.history(this.name);
-        const summary: UpdateSummary = {
+    /**
+     * The `UpdateSummary` the SDK returns from an operation: the newest
+     * history entry the backend recorded for it. A dry run (`previewOnly`)
+     * records nothing, so the outcome is described directly.
+     */
+    private async latestSummary(
+        kind: UpdateKind,
+        outcome: OperationOutcome,
+        message: string | undefined,
+        recorded = true,
+    ): Promise<UpdateSummary> {
+        const newest = recorded ? (await this.history(1, 1)).at(0) : undefined;
+        if (newest) {
+            return newest;
+        }
+        return {
             kind,
             startTime: outcome.startedAt,
             endTime: outcome.endedAt,
@@ -1292,25 +1340,9 @@ export class Stack {
             environment: {},
             config: {},
             result: "succeeded",
-            version: history.entries.length + 1,
+            version: 0,
             ...(outcome.summary ? { resourceChanges: outcome.summary.resourceChanges } : {}),
         };
-        history.entries.push(summary);
-        return summary;
-    }
-
-    private recordFailure(kind: UpdateKind, startedAt: Date, message: string | undefined): void {
-        const history = this.workspace.history(this.name);
-        history.entries.push({
-            kind,
-            startTime: startedAt,
-            endTime: new Date(),
-            message: message ?? "",
-            environment: {},
-            config: {},
-            result: "failed",
-            version: history.entries.length + 1,
-        });
     }
 
     /**
@@ -1338,7 +1370,6 @@ export class Stack {
             opts.onError?.(text);
         };
         let summary: SummaryEvent | undefined;
-        const historyKind: UpdateKind = kind === "up" ? "update" : kind === "preview" ? "preview" : kind;
         const isPreview = kind === "preview" || dryRun;
 
         let operation;
@@ -1356,17 +1387,14 @@ export class Stack {
             throw this.workspace.translate(error, this.name);
         }
         const op = operation as import("./index").Operation;
-        out(headerLine(kind, dryRun, this.name) + "\n");
-        // The library's events carry no sequence or timestamp; the SDK's are
-        // numbered from 0 with epoch seconds, and its stream always ends with
-        // a `cancelEvent` after the summary (the engine's end-of-stream
-        // marker, which the library swallows). Reproduce both.
-        let sequence = 0;
+        // The banner the DIY backend writes arrives as a stdout event; the
+        // facade has already rendered the same line, so it is not written
+        // twice. Events carry the library's own sequence and timestamp, and
+        // the stream ends with the `cancelEvent` marker, so nothing here is
+        // synthesised: they are forwarded as they come.
+        const header = headerLine(kind, dryRun, this.name);
+        out(header + "\n");
         const emit = (event: EngineEvent): void => {
-            event.sequence = sequence++;
-            if (!event.timestamp) {
-                event.timestamp = Math.floor(Date.now() / 1000);
-            }
             opts.onEvent?.(event);
         };
         try {
@@ -1395,19 +1423,18 @@ export class Stack {
                     summary = event.summaryEvent;
                     out(renderSummary(summary));
                 } else if (event.stdoutEvent) {
-                    out(event.stdoutEvent.message);
+                    if (!event.stdoutEvent.message.startsWith(header)) {
+                        out(event.stdoutEvent.message);
+                    }
                 }
                 emit(event);
             }
-            emit({ sequence: 0, timestamp: 0, cancelEvent: {} });
             let result: EngineResult;
             try {
                 result = await op.result();
             } catch (error) {
                 if (error instanceof CancelledError) {
                     out(isPreview ? "Preview canceled\n" : "Update canceled\n");
-                } else if (!isPreview) {
-                    this.recordFailure(historyKind, startedAt, opts.message);
                 }
                 const failure = this.workspace.translate(error, this.name, stdout, stderr);
                 err(`${failure.message}\n`);
@@ -1450,42 +1477,72 @@ export class Stack {
         return this.workspace.importStack(this.name, state);
     }
 
-    /**
-     * The library keeps no update history; `info`/`history` answer from the
-     * operations this process ran on the stack (empty for a freshly opened
-     * stack another process updated).
-     */
+    /** The stack's newest update, from the backend's history. */
     async info(): Promise<UpdateSummary | undefined> {
-        return this.workspace.history(this.name).entries.at(-1);
+        return (await this.history(1, 1)).at(0);
     }
 
-    async history(pageSize?: number, page?: number, _showSecrets?: boolean): Promise<UpdateSummary[]> {
-        const entries = [...this.workspace.history(this.name).entries].reverse();
-        if (pageSize === undefined) {
-            return entries;
+    /**
+     * The backend's update history, newest first. Previews are never
+     * recorded; the DIY backend does not number its updates and reports
+     * version 0.
+     */
+    async history(pageSize?: number, page?: number, showSecrets?: boolean): Promise<UpdateSummary[]> {
+        const handle = await this.workspace.engineStack(this.name, false);
+        let entries: EngineUpdateInfo[];
+        try {
+            entries = handle.history({
+                ...(pageSize !== undefined ? { limit: pageSize } : {}),
+                ...(page !== undefined ? { page } : {}),
+                ...(showSecrets !== undefined ? { showSecrets } : {}),
+            });
+        } catch (error) {
+            throw this.workspace.translate(error, this.name);
         }
-        const start = ((page ?? 1) - 1) * pageSize;
-        return entries.slice(start, start + pageSize);
+        return entries.map(updateSummary);
     }
 
-    private tagsUnsupported(): never {
-        throw this.workspace.commandError(
-            "",
-            `error: stack tags are not supported by the in-process engine (stack '${this.name}')\n`,
-            255,
-        );
+    private async tags(): Promise<{ [key: string]: string }> {
+        const handle = await this.workspace.engineStack(this.name, false);
+        try {
+            return handle.getTags();
+        } catch (error) {
+            throw this.workspace.translate(error, this.name);
+        }
     }
+
+    private async writeTags(tags: { [key: string]: string }): Promise<void> {
+        const handle = await this.workspace.engineStack(this.name, false);
+        try {
+            handle.setTags(tags);
+        } catch (error) {
+            throw this.workspace.translate(error, this.name);
+        }
+    }
+
     async listTags(): Promise<{ [key: string]: string }> {
-        return this.tagsUnsupported();
+        return this.tags();
     }
-    async getTag(_key: string): Promise<string> {
-        return this.tagsUnsupported();
+
+    async getTag(key: string): Promise<string> {
+        const tags = await this.tags();
+        const value = tags[key];
+        if (value === undefined) {
+            throw this.workspace.commandError("", `error: no tag named '${key}' found for stack '${this.name}'\n`, 255);
+        }
+        return value;
     }
-    async setTag(_key: string, _value: string): Promise<void> {
-        return this.tagsUnsupported();
+
+    async setTag(key: string, value: string): Promise<void> {
+        const tags = await this.tags();
+        tags[key] = value;
+        await this.writeTags(tags);
     }
-    async removeTag(_key: string): Promise<void> {
-        return this.tagsUnsupported();
+
+    async removeTag(key: string): Promise<void> {
+        const tags = await this.tags();
+        delete tags[key];
+        await this.writeTags(tags);
     }
 
     async getConfig(key: string): Promise<ConfigValue> {

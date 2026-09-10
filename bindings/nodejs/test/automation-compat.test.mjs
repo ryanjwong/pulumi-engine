@@ -18,6 +18,7 @@
 // providers downloaded on first use) and one inline program.
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
@@ -94,8 +95,10 @@ test("local YAML program: preview, up, outputs, history, export, destroy, remove
     assert.ok(events.every((e) => typeof e.sequence === "number" && !("type" in e)));
     assert.ok(events.some((e) => e.preludeEvent));
     assert.ok(events.some((e) => e.resourcePreEvent?.metadata.op === "create"));
-    // The SDK's stream ends with the engine's cancelEvent marker after the summary.
+    // The library's stream ends with the engine's cancelEvent marker after the
+    // summary; the facade forwards it (and the library's numbering) as-is.
     assert.deepEqual(events.at(-1).cancelEvent, {});
+    assert.ok(events.every((e) => e.timestamp > 0));
     assert.deepEqual(events.map((e) => e.sequence), events.map((_, i) => i));
     const summary = events.at(-2).summaryEvent;
     assert.equal(summary.isPreview, true);
@@ -116,18 +119,37 @@ test("local YAML program: preview, up, outputs, history, export, destroy, remove
     assert.equal(up.outputs.petName.secret, false);
     assert.match(String(up.outputs.petName.value), /^[a-z]+-[a-z]+$/);
     assert.deepEqual(await stack.outputs(), up.outputs);
-    assert.equal((await stack.info()).version, 1);
+    // info/history come from the backend now, not from this process.
+    const info = await stack.info();
+    assert.equal(info.kind, "update");
+    assert.equal(info.result, "succeeded");
+    assert.equal(info.message, "from the facade");
+    assert.ok(info.startTime instanceof Date && info.endTime instanceof Date);
+    assert.deepEqual(info.resourceChanges, up.summary.resourceChanges);
     assert.equal((await stack.history()).length, 1);
+    assert.equal((await stack.history(1, 1)).length, 1);
+
+    // tags round-trip through the backend.
+    await stack.setTag("owner", "compat");
+    assert.equal(await stack.getTag("owner"), "compat");
+    await stack.setTag("env", "test");
+    assert.deepEqual(await stack.listTags(), { owner: "compat", env: "test" });
+    await stack.removeTag("env");
+    assert.deepEqual(await stack.listTags(), { owner: "compat" });
+    await assert.rejects(stack.getTag("env"), (e) => e instanceof CommandError && /no tag named 'env'/.test(e.commandResult.stderr));
 
     // state: export/import round trip and the workspace view of the stack.
     const exported = await stack.exportStack();
     assert.equal(exported.version, 3);
     await stack.importStack(exported);
     assert.deepEqual(await stack.workspace.stackOutputs("dev"), up.outputs);
+    const listed = await stack.workspace.listStacks();
     assert.deepEqual(
-        (await stack.workspace.listStacks()).map((s) => s.name),
+        listed.map((s) => s.name),
         ["dev"],
     );
+    assert.equal(listed[0].current, true);
+    assert.equal(typeof listed[0].lastUpdate, "string");
     const stackSettings = await stack.workspace.stackSettings("dev");
     assert.match(stackSettings.encryptionSalt ?? "", /^v1:/);
     assert.ok(fs.existsSync(path.join(workDir, "Pulumi.dev.yaml")));
@@ -138,7 +160,9 @@ test("local YAML program: preview, up, outputs, history, export, destroy, remove
     const destroy = await stack.destroy();
     assert.deepEqual(destroy.summary.resourceChanges, { delete: 3 });
     assert.equal(destroy.summary.kind, "destroy");
-    assert.equal((await stack.info()).version, 2);
+    // Previews are not recorded; the destroy is the newest backend entry.
+    assert.equal((await stack.info()).kind, "destroy");
+    assert.equal((await stack.history()).length, 2);
     await stack.workspace.removeStack("dev");
     await assert.rejects(
         LocalWorkspace.selectStack({ stackName: "dev", workDir }, opts),
@@ -158,7 +182,7 @@ test("expectNoChanges fails a changing preview the way the CLI does", async () =
     await stack.workspace.removeStack("dev");
 });
 
-test("createStack rejects an existing stack; selectStack a missing one; tags are unsupported", async () => {
+test("createStack rejects an existing stack; selectStack a missing one; tags start empty", async () => {
     const workDir = copyFixture("yaml-random");
     const opts = workspaceOptions();
     const created = await LocalWorkspace.createStack({ stackName: "dev", workDir }, opts);
@@ -170,7 +194,7 @@ test("createStack rejects an existing stack; selectStack a missing one; tags are
         LocalWorkspace.selectStack({ stackName: "missing", workDir }, opts),
         (e) => e instanceof StackNotFoundError && e.cause?.kind === "stackNotFound",
     );
-    await assert.rejects(created.listTags(), CommandError);
+    assert.deepEqual(await created.listTags(), {});
     await created.workspace.removeStack("dev");
 });
 
@@ -264,4 +288,39 @@ test("createAutomationModule binds errors to the caller's SDK instance", async (
     const { minimumVersion } = require("@pulumi/pulumi/automation/minimumVersion");
     const cmd = await mod.PulumiCommand.get();
     assert.equal(mod.parseAndValidatePulumiVersion(minimumVersion, cmd.version.toString(), false).major, 3);
+});
+
+test("envVars reach the language host, and an empty passphrase is a passphrase", async () => {
+    try {
+        execFileSync("which", ["pulumi-language-nodejs"], { stdio: "ignore" });
+    } catch {
+        console.log("skipped: pulumi-language-nodejs is not on PATH (install the pulumi CLI)");
+        return;
+    }
+    const workDir = tmp("node-env");
+    fs.writeFileSync(path.join(workDir, "Pulumi.yaml"), "name: compat-env\nruntime: nodejs\n");
+    fs.writeFileSync(path.join(workDir, "package.json"), JSON.stringify({ name: "compat-env", main: "index.js" }));
+    fs.writeFileSync(
+        path.join(workDir, "index.js"),
+        `const pulumi = require("@pulumi/pulumi");
+exports.fromEnv = process.env.PULUMI_ENGINE_TEST_ENV;
+`,
+    );
+    const stack = await LocalWorkspace.createOrSelectStack(
+        { stackName: "dev", workDir },
+        {
+            envVars: {
+                PULUMI_BACKEND_URL: "file://" + tmp("state"),
+                // An empty passphrase is valid, as it is on the CLI.
+                PULUMI_CONFIG_PASSPHRASE: "",
+                NODE_PATH: path.resolve(here, "..", "node_modules"),
+                PULUMI_ENGINE_TEST_ENV: "x",
+            },
+            secretsProvider: "passphrase",
+        },
+    );
+    const up = await stack.up();
+    assert.equal(up.outputs.fromEnv.value, "x");
+    await stack.destroy();
+    await stack.workspace.removeStack("dev");
 });

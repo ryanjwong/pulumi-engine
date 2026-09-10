@@ -1,0 +1,76 @@
+name: upstream-weekly
+
+# Weekly probe of the latest pulumi/pulumi release: bump the pin on a
+# throwaway branch (never pushed), build, run the unit tests and the drift
+# check, and open or update a tracking issue with the result. Nothing is
+# merged automatically; the bump itself is scripts/bump-pulumi.sh.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  GO_VERSION: "1.26.4"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: latest pkg/v3 tag
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=$(gh api repos/pulumi/pulumi/releases/latest --jq .tag_name)
+          pinned=$(go list -m -f '{{.Version}}' github.com/pulumi/pulumi/pkg/v3)
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "pinned $pinned, latest $latest"
+      - name: bump on a throwaway branch
+        id: bump
+        if: steps.latest.outputs.latest != steps.latest.outputs.pinned
+        run: |
+          git checkout -b probe/pulumi-${{ steps.latest.outputs.latest }}
+          set +e
+          ./scripts/bump-pulumi.sh "${{ steps.latest.outputs.latest }}" --check > bump.log 2>&1
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+          tail -c 60000 bump.log > bump.tail
+      - name: open or update the tracking issue
+        if: steps.latest.outputs.latest != steps.latest.outputs.pinned
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.latest.outputs.latest }}
+          PINNED: ${{ steps.latest.outputs.pinned }}
+          STATUS: ${{ steps.bump.outputs.status }}
+        run: |
+          title="upstream: pulumi $LATEST compatibility probe"
+          if [ "$STATUS" = "0" ]; then verdict="compatible: build, unit tests and drift check pass"; else verdict="INCOMPATIBLE (exit $STATUS): see log"; fi
+          {
+            echo "Weekly probe of pulumi/pulumi **$LATEST** against the pin **$PINNED** (run $GITHUB_RUN_ID, $(date -u +%Y-%m-%d))."
+            echo
+            echo "Result: **$verdict**."
+            echo
+            echo "To bump for real: \`make bump PULUMI=$LATEST\`, then the parity/integration commands it prints. Nothing is merged automatically."
+            echo
+            echo '<details><summary>bump log (tail)</summary>'
+            echo
+            echo '```'
+            cat bump.tail
+            echo '```'
+            echo '</details>'
+          } > body.md
+          number=$(gh issue list --state open --search "\"$title\" in:title" --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n1)
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body-file body.md
+          else
+            gh issue create --title "$title" --body-file body.md --label upstream || gh issue create --title "$title" --body-file body.md
+          fi

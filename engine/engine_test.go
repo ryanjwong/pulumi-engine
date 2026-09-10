@@ -281,7 +281,7 @@ func TestEventFixtures(t *testing.T) {
 				if ev.Type != typed.Type {
 					t.Errorf("type recomputed as %s, recorded %s", ev.Type, typed.Type)
 				}
-				if ev.Type == EventUnknown || ev.Type == EventCancel {
+				if ev.Type == EventUnknown {
 					t.Errorf("fixture contains %s event", ev.Type)
 				}
 				// round trip is lossless
@@ -300,8 +300,13 @@ func TestEventFixtures(t *testing.T) {
 			if len(events) == 0 {
 				t.Fatalf("empty fixture")
 			}
-			if events[len(events)-1].Type != EventSummary {
-				t.Errorf("last event is %s, want summary", events[len(events)-1].Type)
+			if n := len(events); events[n-1].Type != EventCancel || events[n-2].Type != EventSummary {
+				t.Errorf("stream should end with summary then cancel, got %v", eventTypes(events[max(0, n-3):]))
+			}
+			for i, e := range events {
+				if e.Sequence != i || e.Timestamp == 0 {
+					t.Errorf("event %d: sequence %d timestamp %d", i, e.Sequence, e.Timestamp)
+				}
 			}
 			for _, e := range events {
 				raw, _ := json.Marshal(e)
@@ -478,7 +483,11 @@ func TestOfflineLifecycle(t *testing.T) {
 	if res.Changes["create"] != 1 || !res.Summary.IsPreview {
 		t.Errorf("preview result %+v", res)
 	}
-	if types[0] != EventPrelude || types[len(types)-1] != EventSummary {
+	// The DIY backend's "Previewing update (dev):" banner is captured from
+	// the process stdout into a stdout event; the stream ends with the
+	// engine's cancel terminator after the summary.
+	if types[0] != EventStdout || types[1] != EventPrelude || types[len(types)-2] != EventSummary ||
+		types[len(types)-1] != EventCancel {
 		t.Errorf("preview events %v", types)
 	}
 

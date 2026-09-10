@@ -63,7 +63,9 @@ test("inline program: up, outputs, destroy in one process", async () => {
     const result = await up.result();
     await up.release();
     assert.equal(result.changes.create, 3);
-    assert.equal(events.at(-1)?.type, "summary");
+    // The library ends every stream with the cancel terminator after the summary.
+    assert.equal(events.at(-1)?.type, "cancel");
+    assert.equal(events.at(-2)?.type, "summary");
     assert.equal(result.outputs?.values.samePid, true, "program must run in this process");
     assert.equal(result.outputs?.values.password, "[secret]");
     assert.equal(result.outputs?.values.apiKeyLen, "[secret]");

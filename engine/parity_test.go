@@ -247,7 +247,9 @@ func eventSignature(e apitype.EngineEvent) string {
 	case e.CancelEvent != nil:
 		return "cancel"
 	case e.StdoutEvent != nil:
-		return "stdout"
+		// The library delivers the backend's "Updating (dev):" banner as a
+		// stdout event; the CLI prints it to its stdout, outside the log.
+		return "diagnostic stdout"
 	case e.ProgressEvent != nil:
 		return "progress"
 	default:
@@ -307,8 +309,8 @@ func compareEventStreams(t *testing.T, what string, cliEvents, libEvents []apity
 			case strings.HasPrefix(s, "diagnostic"):
 				diags[s]++
 			case s == "cancel":
-				// The CLI's event log ends with the engine's cancel
-				// terminator; the library consumes it (closed channel).
+				// Both streams end with the engine's cancel terminator;
+				// compared through first/last below, not as a step.
 			default:
 				steps = append(steps, s)
 			}
@@ -338,7 +340,7 @@ func compareEventStreams(t *testing.T, what string, cliEvents, libEvents []apity
 	}
 	firstNonDiag := func(events []apitype.EngineEvent) string {
 		for _, e := range events {
-			if e.DiagnosticEvent == nil {
+			if e.DiagnosticEvent == nil && e.StdoutEvent == nil {
 				return eventSignature(e)
 			}
 		}
@@ -350,8 +352,13 @@ func compareEventStreams(t *testing.T, what string, cliEvents, libEvents []apity
 	if cliLast != "cancel" {
 		t.Errorf("%s: CLI event log should end with the cancel terminator, got %q (first %q)", what, cliLast, cliFirst)
 	}
-	if !strings.HasPrefix(libLast, "summary") {
-		t.Errorf("%s: library stream should end with summary, got %q (first %q)", what, libLast, libFirst)
+	if libLast != "cancel" {
+		t.Errorf("%s: library stream should end with the cancel terminator, got %q (first %q)", what, libLast, libFirst)
+	}
+	for i, e := range libEvents {
+		if e.Sequence != i || e.Timestamp == 0 {
+			t.Errorf("%s: library event %d has sequence %d timestamp %d", what, i, e.Sequence, e.Timestamp)
+		}
 	}
 }
 
@@ -378,7 +385,7 @@ func TestIntegrationParityLibraryWritesCLIReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	res, events, err := waitOp(t, st.Up(ctx, LocalProgram{Dir: dir}, Options{Message: "library up"}))
+	res, events, err := waitOp(t, st.Up(ctx, localProgram(dir), Options{Message: "library up"}))
 	if err != nil {
 		t.Fatalf("library up: %v (%v)", err, eventTypes(events))
 	}
@@ -504,7 +511,7 @@ func TestIntegrationParityCLIWritesLibraryReads(t *testing.T) {
 		t.Errorf("GetConfig(petLength) = %+v %v %v", v, ok, err)
 	}
 
-	res, events, err := waitOp(t, st.Preview(ctx, LocalProgram{Dir: dir}, Options{}))
+	res, events, err := waitOp(t, st.Preview(ctx, localProgram(dir), Options{}))
 	if err != nil {
 		t.Fatalf("library preview: %v (%v)", err, eventTypes(events))
 	}
@@ -597,7 +604,7 @@ func TestIntegrationParityEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, libUp, err := waitOp(t, st.Up(ctx, LocalProgram{Dir: libDir}, Options{}))
+	_, libUp, err := waitOp(t, st.Up(ctx, localProgram(libDir), Options{}))
 	if err != nil {
 		t.Fatalf("library up: %v", err)
 	}
@@ -627,7 +634,7 @@ func TestIntegrationParityEvents(t *testing.T) {
 
 	previewLog := filepath.Join(logDir, "cli-preview.jsonl")
 	c.mustRun(t, cliDir, "preview", "--event-log", previewLog, "--stack", "cli")
-	_, libPreview, err := waitOp(t, st.Preview(ctx, LocalProgram{Dir: libDir}, Options{}))
+	_, libPreview, err := waitOp(t, st.Preview(ctx, localProgram(libDir), Options{}))
 	if err != nil {
 		t.Fatalf("library preview: %v", err)
 	}
@@ -819,7 +826,7 @@ func TestIntegrationParityLockAndCancel(t *testing.T) {
 	}
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	op := st.Up(cctx, LocalProgram{Dir: libDir}, Options{})
+	op := st.Up(cctx, localProgram(libDir), Options{})
 	inFlight := make(chan struct{})
 	go func() {
 		signalled := false

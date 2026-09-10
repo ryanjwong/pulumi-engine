@@ -22,6 +22,7 @@ export type ErrorKind =
     | "stackExists"
     | "pendingOperations"
     | "cancelled"
+    | "unsupported"
     | "unclassified";
 
 /** Base class of every error raised by the library. */
@@ -112,6 +113,21 @@ export class CancelledError extends PulumiError {
     }
 }
 
+/**
+ * The backend (or Pulumi at the pinned version) does not support the feature
+ * asked for: `feature` names it, `backend` the backend it is unsupported on.
+ */
+export class UnsupportedError extends PulumiError {
+    readonly feature: string;
+    readonly backend: string;
+    constructor(feature: string, backend: string, message: string) {
+        super("unsupported", message);
+        this.name = "UnsupportedError";
+        this.feature = feature;
+        this.backend = backend;
+    }
+}
+
 /** Build the right Error subclass from the ABI's error JSON. */
 export function errorFromJSON(json: string): PulumiError {
     let e: Record<string, unknown>;
@@ -148,6 +164,8 @@ export function errorFromJSON(json: string): PulumiError {
             return new PendingOperationsError((e.urns as string[]) ?? [], message, result);
         case "cancelled":
             return new CancelledError(String(e.operation ?? ""), message, result);
+        case "unsupported":
+            return new UnsupportedError(String(e.feature ?? ""), String(e.backend ?? ""), message);
         default:
             return new PulumiError("unclassified", message, result);
     }

@@ -48,6 +48,12 @@ export interface StackSpec {
     /** "passphrase" (needs passphrase), "service", a KMS URL, or "b64" (tests only). */
     secrets?: { provider?: string; passphrase?: string };
     config?: Record<string, ConfigInput>;
+    /**
+     * Environment overlay for every provider plugin and language host the
+     * operations on this stack launch. It never touches this process's own
+     * environment; `Options.env` adds to it for one operation.
+     */
+    env?: Record<string, string>;
     /** Create the stack when it does not exist. */
     create?: boolean;
 }
@@ -64,11 +70,17 @@ export interface Options {
     showSecrets?: boolean;
     /** Refresh/destroy as a preview. */
     dryRun?: boolean;
+    /** Environment for the plugins and language host of this operation, over `StackSpec.env`. */
+    env?: Record<string, string>;
     /** Aborting the signal cancels the operation gracefully. */
     signal?: AbortSignal;
 }
 
-export type LocalProgram = { mode: "local"; dir: string };
+/**
+ * A program directory run by its language host. `languageVersion` pins the
+ * runtime version the host should use ("1.38.5"), when the runtime supports it.
+ */
+export type LocalProgram = { mode: "local"; dir: string; languageVersion?: string };
 export type CallbackProgram = { mode: "callback"; address: string };
 /** An inline program: runs in this process through @pulumi/pulumi's LanguageServer. */
 export type InlineProgram = () => void | Promise<void> | Promise<Record<string, unknown>>;
@@ -91,13 +103,19 @@ export type EventType =
     | "startDebugging"
     | "progress"
     | "error"
+    | "cancel"
     | "unknown";
 
-/** One engine event: Pulumi's engine event JSON plus a `type` discriminator. */
+/**
+ * One engine event: Pulumi's engine event JSON plus a `type` discriminator.
+ * `sequence` counts from 0 within the operation and `timestamp` is epoch
+ * seconds; every stream ends with a `cancel` event after the summary.
+ */
 export interface Event {
     type: EventType;
     sequence: number;
     timestamp: number;
+    cancelEvent?: Record<string, never>;
     diagnosticEvent?: { urn?: string; prefix?: string; message: string; severity: string; ephemeral?: boolean };
     preludeEvent?: { config: Record<string, string> };
     summaryEvent?: { maybeCorrupt: boolean; durationSeconds: number; resourceChanges: Record<string, number>; isPreview: boolean };
@@ -143,6 +161,60 @@ export interface Result {
     failures?: { URN: string; Type: string; Op: string; Provider: string; Message: string }[];
     cancelled?: boolean;
     durationMs: number;
+}
+
+/** One entry of a stack's update history, newest first. */
+export interface UpdateInfo {
+    /** "update", "preview", "refresh", "destroy", "import", "rename". */
+    kind: string;
+    /** "succeeded", "failed", "in-progress" or "not-started". */
+    result: string;
+    message: string;
+    /** Epoch seconds. */
+    startTime: number;
+    /** Epoch seconds. */
+    endTime: number;
+    /** The update's sequence number on HTTP backends; DIY backends report 0. */
+    version: number;
+    environment: Record<string, string>;
+    config: Record<string, ConfigValue>;
+    resourceChanges?: Record<string, number>;
+}
+
+/** Options for {@link Stack.history}. */
+export interface HistoryOptions {
+    /** Maximum entries (0 or unset: what the backend returns). */
+    limit?: number;
+    /** Page of `limit` entries, from 1. */
+    page?: number;
+    /** Decrypt secret config values with the stack's secrets manager. */
+    showSecrets?: boolean;
+}
+
+/** One entry of a stack listing. */
+export interface StackSummary {
+    /** The reference as the backend renders it for a listing ("dev"). */
+    name: string;
+    /** The fully qualified reference ("org/project/dev"). */
+    fullName: string;
+    project?: string;
+    /** ISO-8601 time of the last update, when the backend knows it. */
+    lastUpdate?: string;
+    resourceCount?: number;
+}
+
+/** Filter for {@link listStacks}. */
+export interface ListFilter {
+    project?: string;
+    /** HTTP backends only; DIY backends reject it. */
+    organization?: string;
+    tagName?: string;
+    tagValue?: string;
+}
+
+/** List the stacks a backend holds. */
+export function listStacks(backend: StackSpec["backend"], filter: ListFilter = {}): StackSummary[] {
+    return JSON.parse(native().listStacks(JSON.stringify({ backend, filter }))) as StackSummary[];
 }
 
 /** Version of the library and of the Pulumi packages it embeds. */
@@ -343,6 +415,24 @@ export class Stack {
         this.ensureOpen();
         const v = JSON.parse(native().stackGetConfig(this.handle, key));
         return v === null ? undefined : (v as ConfigValue);
+    }
+
+    /** The stack's tags. */
+    getTags(): Record<string, string> {
+        this.ensureOpen();
+        return JSON.parse(native().stackGetTags(this.handle)) as Record<string, string>;
+    }
+
+    /** Replace every tag on the stack. */
+    setTags(tags: Record<string, string>): void {
+        this.ensureOpen();
+        native().stackSetTags(this.handle, JSON.stringify(tags));
+    }
+
+    /** The stack's update history, newest first. Previews are not recorded. */
+    history(options: HistoryOptions = {}): UpdateInfo[] {
+        this.ensureOpen();
+        return JSON.parse(native().stackHistory(this.handle, JSON.stringify(options))) as UpdateInfo[];
     }
 
     /** Cancel running operations (and the backend's current update where supported). */
