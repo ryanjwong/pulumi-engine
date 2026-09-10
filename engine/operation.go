@@ -352,10 +352,12 @@ func (o *Operation) execute(ctx context.Context, program Program, opts Options) 
 		forwarded := make(chan struct{})
 		go func() {
 			defer close(forwarded)
+			// Internal events (default provider steps, the refresh steps of
+			// an up --refresh) are passed through: that is what the CLI's
+			// --event-log (and so the Automation API) carries, and what the
+			// loopback sink delivers for refresh and destroy below. Only the
+			// CLI's terminal display and `--json` drop them.
 			for e := range raw {
-				if e.Internal() {
-					continue
-				}
 				ev, err := convertEngineEvent(e, opts.ShowSecrets)
 				if err != nil {
 					ev = eventFromAPI(diagnosticEvent("warning", fmt.Sprintf("pulumi-engine: unconvertible engine event: %v", err)))

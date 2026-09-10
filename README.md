@@ -21,7 +21,8 @@ Three layers, one implementation:
 
 - It is not the `pulumi` CLI. Nothing shells out to `pulumi`; the CLI is not
   required at build or run time. The repository uses it only to compare
-  behaviour.
+  behaviour: [docs/cli-parity.md](docs/cli-parity.md) records how the two
+  agree on state, secrets, config, events, locks, cancellation and plugins.
 - It is not a daemon. There is no long-running service; every operation runs
   in the caller's goroutines/threads and finishes when `Wait` returns.
 - It does not replace provider plugins. `pulumi-resource-*` and
@@ -170,7 +171,11 @@ and checkpoint writing.
 
 Events for preview and up come from the `chan engine.Event` those backend
 methods accept, translated with `display.ConvertEngineEvent` (the CLI's own
-JSON translation, which does the redaction). Pulumi's `Backend.Refresh` and
+JSON translation, which does the redaction). Engine-internal step events
+(default provider steps, the refresh steps of an `up --refresh`) are passed
+through: that is what `pulumi up --event-log` and therefore the Automation
+API deliver; only the CLI's terminal display and `--json` output drop them
+(see [docs/cli-parity.md](docs/cli-parity.md)). Pulumi's `Backend.Refresh` and
 `Backend.Destroy` take no event channel; their events are only visible to the
 display layer, which can stream them to an `Events` gRPC service when
 `display.Options.EventLogPath` is `tcp://<addr>` (the path Pulumi built for
@@ -307,6 +312,7 @@ loopback gRPC.
 make build         # go build ./...
 make test          # unit tests (offline, no plugins)
 make integration   # PULUMI_ENGINE_INTEGRATION=1: random/command providers, YAML host
+make parity        # the CLI parity subset of the above (needs the pulumi CLI; docs/cli-parity.md)
 make lib           # build/libpulumi.{dylib,so} + header
 make abitest       # cgo test linking the built library
 make node          # copy the lib into the binding, tsc, node --test
@@ -317,8 +323,9 @@ Recording event fixtures: `PULUMI_ENGINE_RECORD_DIR=$PWD/engine/testdata/events 
 
 Toolchain: Go 1.26 with cgo, Node 20+ and pnpm 10 for the binding, network on
 first run for plugin downloads. GitHub Actions runs the unit tests, the
-integration tests, the library build matrix (darwin/arm64, linux/amd64) with
-the ABI test, and the Node binding on both platforms.
+integration tests (including the CLI parity tests against a pinned `pulumi`
+installed with `pulumi/actions`), the library build matrix (darwin/arm64,
+linux/amd64) with the ABI test, and the Node binding on both platforms.
 
 ## Decisions log
 
