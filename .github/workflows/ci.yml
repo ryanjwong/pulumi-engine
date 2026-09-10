@@ -60,7 +60,7 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
       - run: make lib
-      - run: go test ./capi/... -count=1
+      - run: make abitest
       - uses: actions/upload-artifact@v4
         with:
           name: libpulumi-${{ matrix.platform }}

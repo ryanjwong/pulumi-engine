@@ -1,0 +1,19 @@
+name: engine-yaml
+runtime: yaml
+description: LocalProgram integration fixture (random provider only)
+config:
+  petLength:
+    type: integer
+    default: 2
+resources:
+  pet:
+    type: random:RandomPet
+    properties:
+      length: ${petLength}
+  token:
+    type: random:RandomPassword
+    properties:
+      length: 12
+outputs:
+  petName: ${pet.id}
+  token: ${token.result}

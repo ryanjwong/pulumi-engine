@@ -1,0 +1,30 @@
+name: engine-yaml
+runtime: yaml
+description: LocalProgram fixture with slow create steps, for cancellation
+resources:
+  first:
+    type: random:RandomPet
+  slow1:
+    type: command:local:Command
+    properties:
+      create: "sleep 6"
+      delete: "true"
+    options:
+      dependsOn:
+        - ${first}
+  slow2:
+    type: command:local:Command
+    properties:
+      create: "sleep 6"
+      delete: "true"
+    options:
+      dependsOn:
+        - ${slow1}
+  slow3:
+    type: command:local:Command
+    properties:
+      create: "sleep 6"
+      delete: "true"
+    options:
+      dependsOn:
+        - ${slow2}

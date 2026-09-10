@@ -14,14 +14,17 @@ GOARCH  := $(shell $(GO) env GOARCH)
 
 ifeq ($(GOOS),darwin)
 LIB_EXT := dylib
+# Give the dylib an @rpath install name so consumers can locate it via rpath.
+LIB_LDFLAGS := -ldflags "-extldflags=-Wl,-install_name,@rpath/libpulumi.dylib"
 else
 LIB_EXT := so
+LIB_LDFLAGS :=
 endif
 
 LIB      := $(BUILD)/libpulumi.$(LIB_EXT)
 HEADER   := $(BUILD)/libpulumi.h
 
-.PHONY: build test integration lib node node-install lint clean
+.PHONY: build test integration lib abitest node node-install node-build lint clean
 
 build:
 	$(GO) build ./...
@@ -36,16 +39,24 @@ lib: $(LIB)
 
 $(LIB): $(shell find . -name '*.go' -not -path './bindings/*') go.mod go.sum
 	mkdir -p $(BUILD)
-	CGO_ENABLED=1 $(GO) build -buildmode=c-shared -trimpath -o $(LIB) ./capi
+	CGO_ENABLED=1 $(GO) build -buildmode=c-shared -trimpath $(LIB_LDFLAGS) -o $(LIB) ./capi
 	@echo "built $(LIB) and $(HEADER)"
+
+# Exercises the built shared library through its C header (cgo test that
+# links libpulumi). Needs `make lib` first.
+abitest: lib
+	$(GO) test -tags abitest ./capi/abitest -count=1 -v
 
 node-install:
 	cd bindings/nodejs && pnpm install --frozen-lockfile
 
-node: lib node-install
+node-build: lib node-install
 	mkdir -p bindings/nodejs/lib/native
 	cp $(LIB) bindings/nodejs/lib/native/libpulumi-$(GOOS)-$(GOARCH).$(LIB_EXT)
-	cd bindings/nodejs && pnpm build && pnpm test
+	cd bindings/nodejs && pnpm build
+
+node: node-build
+	cd bindings/nodejs && pnpm test
 
 lint:
 	@if command -v golangci-lint >/dev/null 2>&1; then golangci-lint run ./...; else echo "golangci-lint not installed; running go vet"; $(GO) vet ./...; fi

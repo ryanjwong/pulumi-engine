@@ -1,0 +1,40 @@
+{
+  "name": "@pulumi-engine/node",
+  "version": "0.1.0",
+  "description": "Pulumi engine as an in-process library for Node.js (FFI over libpulumi).",
+  "license": "Apache-2.0",
+  "author": "Ryan Wong",
+  "type": "commonjs",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "files": [
+    "dist",
+    "lib/native",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test --test-concurrency=1 --test-timeout=600000 dist/test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "koffi": "^2.9.0"
+  },
+  "peerDependencies": {
+    "@pulumi/pulumi": ">=3.150.0"
+  },
+  "peerDependenciesMeta": {
+    "@pulumi/pulumi": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@grpc/grpc-js": "^1.12.0",
+    "@pulumi/pulumi": "^3.200.0",
+    "@pulumi/random": "^4.16.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
