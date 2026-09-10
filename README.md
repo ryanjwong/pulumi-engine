@@ -16,6 +16,7 @@ Three layers, one implementation:
 | Go library | `Open`, `Stack.Preview/Up/Refresh/Destroy`, events, typed errors | `engine/` (`github.com/ryanjwong/pulumi-engine/engine`) |
 | C ABI | `libpulumi.{dylib,so}`, handles + JSON, no callbacks | `capi/` (`go build -buildmode=c-shared`) |
 | Node binding | `@pulumi-engine/node`, koffi FFI, async events, inline programs | `bindings/nodejs/` |
+| Python binding | `pulumi_engine`, cffi (ABI mode, no compile step), iterator events, inline programs | `bindings/python/` |
 
 ## What it is not
 
@@ -32,9 +33,9 @@ Three layers, one implementation:
 
 ## Program modes
 
-| mode | Go | C ABI / Node | how it runs |
+| mode | Go | C ABI / Node / Python | how it runs |
 |-|-|-|-|
-| in-process | `GoProgram(func(*pulumi.Context) error)` | (Node: `async () => {...}`, see inline below) | A LanguageRuntime gRPC service is served from a goroutine in this process; the engine connects to it as the CLI would with `--client`. The Go SDK runs the function with `pulumi.RunWithContext` against the engine's resource monitor. No subprocess. |
+| in-process | `GoProgram(func(*pulumi.Context) error)` | (Node: `async () => {...}`, Python: `def program(): ...`, see inline below) | A LanguageRuntime gRPC service is served from a goroutine in this process; the engine connects to it as the CLI would with `--client`. The Go SDK runs the function with `pulumi.RunWithContext` against the engine's resource monitor. No subprocess. |
 | callback | `CallbackProgram{Address}` | `{"mode":"callback","address":...}` | A LanguageRuntime gRPC server the caller runs. This is the mechanism behind `pulumi up --client` and behind inline Automation API programs in every SDK. |
 | local | `LocalProgram{Dir}` | `{"mode":"local","dir":...}` | The project in `Dir` (`Pulumi.yaml`) is executed by the stock `pulumi-language-<runtime>` plugin, installed on demand. The YAML host needs no toolchain; Node/Python/Go hosts need theirs. |
 
@@ -44,7 +45,10 @@ The Node binding's **inline** mode (`stack.up(async () => { new random.RandomPet
 starts `@pulumi/pulumi`'s own `LanguageServer` (`automation/server`, the class
 the Automation API uses for inline programs) on a loopback port and passes it
 as a callback program. The program runs in the Node process; the tests check
-`process.pid` to prove it.
+`process.pid` to prove it. The Python binding does the same with
+`pulumi.automation._server.LanguageServer` (the class the Python Automation
+API uses for inline programs) on a `grpc` server; see
+`bindings/python/README.md` for the one workaround it needs.
 
 ## Quick start: Go
 
@@ -123,6 +127,41 @@ async function (inline; needs `@pulumi/pulumi` and `@grpc/grpc-js` in your
 project). The binding never blocks the event loop: the two blocking ABI calls
 run on koffi's async thread pool. See `bindings/nodejs/README.md`.
 
+## Quick start: Python
+
+```python
+import pulumi_engine as pe
+
+stack = pe.open_stack({
+    "name": "dev",
+    "project": {"name": "demo"},
+    "backend": {"url": "file:///var/lib/demo/state"},
+    "secrets": {"provider": "passphrase", "passphrase": os.environ["DEMO_PASSPHRASE"]},
+    "config": {"apiKey": pe.Secret("...")},
+    "create": True,
+})
+
+def program():                       # inline: runs in this process (needs pulumi + grpcio)
+    import pulumi, pulumi_random as random
+    pet = random.RandomPet("pet")
+    pulumi.export("name", pet.id)
+
+with stack.up(program, {"message": "first deploy"}) as op:   # leaving the block cancels an unfinished op
+    for event in op:                                          # iterator of event dicts, secrets redacted
+        print(event["type"])
+    try:
+        result = op.result()                                  # typed exceptions
+        print(result["changes"], result["outputs"]["values"]["name"])
+    except pe.ResourceOpFailedError as e:
+        print(e.urn, e.op, e)
+```
+
+Programs: `{"mode": "local", "dir": ...}` (`pe.LocalProgram`), `{"mode":
+"callback", "address": ...}` (`pe.CallbackProgram`), or a callable (inline).
+The blocking ABI calls release the GIL (cffi does that for every C call), so
+other threads run while `result()` or the event iterator waits. See
+`bindings/python/README.md`.
+
 ## Backends, secrets, credentials
 
 The backend is chosen by `Backend.URL`: `file://`, `s3://`, `gs://`,
@@ -189,7 +228,30 @@ Typed errors (`errors.As` / `engine.KindOf` / `error.kind` over the ABI):
 `InvalidSpec{Field}`, `ResourceOpFailed{URN,Type,Op,Provider,Message}`
 (all failures are in `Result.Failures`), `ProgramFailed{Message}`,
 `ConcurrentUpdate`, `StackNotFound`, `StackExists`, `PendingOperations{URNs}`,
-`Cancelled{Operation}`, `Unsupported{Feature,Backend}`, `Unclassified{Err}`.
+`Cancelled{Operation}`, `PlanViolation{Resources}`, `Unsupported{Feature,Backend}`,
+`Unclassified{Err}`.
+
+## Update plans
+
+`Preview` with `Options.SavePlan` (a path) writes the plan file
+`pulumi preview --save-plan` writes; `Options.GeneratePlan` returns it in
+`Result.Plan` instead (or as well). `Up` with `Options.Plan` (a path) or
+`Options.PlanJSON` (the document) is constrained to that plan the way
+`pulumi up --plan` is: the engine refuses any operation the plan did not
+propose (a replace where an update was planned, an update where a same was
+planned, a resource the plan does not know) and the operation fails with
+`PlanViolation{Resources: [{URN, Message}]}` before that operation is
+applied. The plan is `apitype.DeploymentPlanV1`, serialised with the same
+encoder the CLI uses, with secret values encrypted by the stack's secrets
+provider unless `ShowSecrets` was set for the preview, so a plan written by
+the library is honoured by the CLI for the same stack and vice versa
+(`TestIntegrationParityPlans`; [docs/cli-parity.md](docs/cli-parity.md) row
+10). One difference: the plan manifest's `version` (the CLI binary's
+version string) is empty in a library-written plan; neither side checks it.
+Over the ABI the options are `savePlan`, `generatePlan`, `plan`, `planJson`
+and the result field `plan`; the Node binding types them on `Options` and
+`Result` (`PlanViolationError`), the automation-compat facade maps the
+SDK's `preview({ plan })` / `up({ plan })`, and Python mirrors Node.
 
 ## How it drives Pulumi
 
@@ -229,6 +291,15 @@ and language hosts launched by the library (Pulumi launches those with a nil
 env). The host's diag sinks feed the operation's event stream, so plugin
 output and `pulumi.log` calls arrive as diagnostics as they do from the CLI.
 
+Update plans use Pulumi's own machinery unchanged: `engine.UpdateOptions.GeneratePlan`
+makes the preview's step generator record a `deploy.Plan`, which
+`backend.PreviewStack` returns; `stack.SerializePlan/DeserializePlan` are
+the CLI's plan file codec; `engine.UpdateOptions.Plan` on an up makes the
+step generator check every step and goal against it. Because the library
+runs `UpdateStack` with `SkipPreview`, the plan is checked once, during the
+real update, which is also where the CLI's `--plan` enforcement happens
+(its preview phase only clones the plan).
+
 Copied from pulumi/pulumi (Apache-2.0): everything lives under
 [`internal/upstream/`](internal/upstream), one file per copied unit with a
 header naming the upstream file, version and sha256, and begin/end markers
@@ -244,6 +315,7 @@ behaviour a public Pulumi API could provide; the hooks we wish existed are in
 | `github.com/pulumi/pulumi/pkg/v3`, `sdk/v3` | **v3.237.0** (go.mod) |
 | `pulumi` CLI versions the parity suite was verified against | 3.218.0, 3.237.0 (CI, `PULUMI_CLI_VERSION`), 3.250.0 |
 | `@pulumi/pulumi` Node SDK the binding is tested with | 3.261.0 (`bindings/nodejs/pnpm-lock.yaml`; peer range `>=3.150.0`) |
+| `pulumi` Python SDK the binding is tested with | 3.262.0 (`pulumi_engine[inline]` requires `>=3.150.0`, `grpcio>=1.60`; Python 3.12 in CI, 3.14 locally) |
 | language hosts / providers in tests | `pulumi-language-yaml` 1.38.5 (pinned when installed by the tests), `pulumi-random` 4.16.8, `pulumi-command` latest |
 | event schema | `apitype.EngineEvent` of the pinned sdk (the `--event-log` / Automation API JSON); deployment schema v3 (`apitype.DeploymentSchemaVersionCurrent`); service API `application/vnd.pulumi+9` |
 
@@ -277,16 +349,17 @@ v4.16.8 because newer releases require a newer `sdk/v3`.
 Built by `make lib` into `build/libpulumi.{dylib,so}` with the generated
 `build/libpulumi.h` (the contract is also in the header's preamble).
 CI builds darwin/arm64 and linux/amd64 and runs the ABI test against the
-built library (`make abitest`).
+built library (`make abitest`); releases build all four platforms (see
+"Install" below).
 
 | function | purpose |
 |-|-|
 | `pulumi_version()` | version string |
 | `pulumi_stack_open(spec_json, &err)` | handle > 0, or 0 with `err` |
-| `pulumi_op_start(handle, request_json, &err)` | op id > 0; request `{"kind","program","options"}` |
+| `pulumi_op_start(handle, request_json, &err)` | op id > 0; request `{"kind","program","options"}`; options include the plan fields `savePlan`, `generatePlan` (preview) and `plan`, `planJson` (up) |
 | `pulumi_op_next_event(op, timeout_ms)` | event JSON, `""` on timeout, `NULL` at end |
 | `pulumi_op_cancel(op)` | graceful cancel; second call terminates |
-| `pulumi_op_wait(op, &err)` | result JSON, or `NULL` with error JSON (`kind`, fields, partial `result`) |
+| `pulumi_op_wait(op, &err)` | result JSON (with `plan` for a plan-generating preview), or `NULL` with error JSON (`kind`, fields, partial `result`; `resources` for `planViolation`) |
 | `pulumi_op_release(op)` | forget the op id |
 | `pulumi_stack_export/import/outputs/set_config/get_config/remove/cancel/close` | as named |
 | `pulumi_stack_get_tags/set_tags(handle, tags_json)` | tags as a JSON object; set replaces all |
@@ -372,19 +445,39 @@ loopback gRPC.
   downloads (and `GITHUB_TOKEN` for them): `workspace.GetPluginPath` reads
   the process environment; the spec's `PULUMI_HOME` reaches plugin
   subprocesses only ([docs/upstream.md](docs/upstream.md) #9).
-- Policy packs, update plans (`--plan`), `--target-replace` beyond the
-  `Targets`/`Replaces` options, import operations, stack rename,
-  ESC environments, remote (Pulumi Deployments) operations.
+- Policy packs, `--target-replace` beyond the `Targets`/`Replaces` options,
+  import operations, stack rename, ESC environments, remote (Pulumi
+  Deployments) operations, the CLI's `--strict` (generate a plan during an
+  up's own preview and constrain the update to it; the library's up has no
+  preview phase, so generate with `Preview` and pass the plan to `Up`).
 - Windows.
+
+## Install
+
+Releases are git tags `vX.Y.Z` built by `release.yml`
+([docs/releasing.md](docs/releasing.md)): `libpulumi` for darwin-arm64,
+darwin-amd64, linux-amd64 and linux-arm64, each built and load-tested on a
+native runner, attached to the GitHub release, and the Node packages on
+GitHub Packages.
+
+| language | install |
+|-|-|
+| Go | `go get github.com/ryanjwong/pulumi-engine/engine@vX.Y.Z` (cgo not needed; the engine is plain Go) |
+| C / anything with `dlopen` | download `libpulumi-<os>-<arch>.tar.gz` from the release (`libpulumi.{dylib,so}`, `libpulumi.h`, `SHA256SUMS`), check it against the release's `SHA256SUMS` |
+| Node | `npm install @pulumi-engine/node@npm:@ryanjwong/pulumi-engine-node@X.Y.Z` with `@ryanjwong:registry=https://npm.pkg.github.com` (and a token with `read:packages`) in `.npmrc`. The main package pulls the one `@ryanjwong/pulumi-engine-node-<os>-<arch>` optional dependency that matches the host; `libraryPath()` shows which library loaded. |
+| Python | `pip install "pulumi_engine[inline] @ git+https://github.com/ryanjwong/pulumi-engine@vX.Y.Z#subdirectory=bindings/python"` plus the release tarball's library: set `PULUMI_ENGINE_LIB=/path/to/libpulumi.<ext>` or copy it to `pulumi_engine/native/libpulumi-<os>-<arch>.<ext>`. The wheel is pure Python (cffi in ABI mode). |
+
+`make release-dry-run VERSION=X.Y.Z` builds all of it for the host platform
+into `dist/` without publishing.
 
 ## Roadmap
 
-- Python binding via cffi over the same ABI.
 - Pooled provider host: keep provider subprocesses warm across operations to
   cut cold start (needs an `engine.UpdateOptions.Host` implementation).
 - Policy packs (`LocalPolicyPacks`/`RequiredPolicies` are already on the
   engine options).
-- Update plans: generate on preview, constrain on up.
+- Publish the Python binding as platform wheels carrying the library, the
+  way the Node platform packages do.
 - Upstream the asks in [docs/upstream.md](docs/upstream.md) (language-host
   env, a host factory on the engine's context, `httpstate.NewWithAccount`, a
   `Display.Stdout` route for the banner, the executor fix) and delete the
@@ -403,6 +496,8 @@ make parity        # the CLI parity subset of the above (needs the pulumi CLI; d
 make lib           # build/libpulumi.{dylib,so} + header
 make abitest       # cgo test linking the built library
 make node          # copy the lib into the binding, tsc, node --test
+make python        # venv under bindings/python/.venv, pip install -e, pytest against build/libpulumi.*
+make release-dry-run VERSION=X.Y.Z   # dist/: lib tarball + abitest, npm packages, Python wheel (docs/releasing.md)
 make lint          # golangci-lint if installed, else go vet
 make upstream-check   # drift check of internal/upstream against the pinned Pulumi modules
 make bump PULUMI=vX.Y.Z   # bump the Pulumi pin (scripts/bump-pulumi.sh)
@@ -410,11 +505,14 @@ make bump PULUMI=vX.Y.Z   # bump the Pulumi pin (scripts/bump-pulumi.sh)
 
 Recording event fixtures: `PULUMI_ENGINE_RECORD_DIR=$PWD/engine/testdata/events make integration`.
 
-Toolchain: Go 1.26 with cgo, Node 20+ and pnpm 10 for the binding, network on
-first run for plugin downloads. GitHub Actions runs the unit tests, the
-integration tests (including the CLI parity tests against a pinned `pulumi`
-installed with `pulumi/actions`), the library build matrix (darwin/arm64,
-linux/amd64) with the ABI test, and the Node binding on both platforms.
+Toolchain: Go 1.26 with cgo, Node 20+ and pnpm 10 for the Node binding,
+Python 3.10+ for the Python binding, network on first run for plugin
+downloads. GitHub Actions runs the unit tests, the integration tests
+(including the CLI parity tests against a pinned `pulumi` installed with
+`pulumi/actions`), the library build matrix (darwin/arm64, linux/amd64)
+with the ABI test, the Node and Python bindings on both platforms, and the
+release dry run (which also installs the packed Node package into a scratch
+project).
 
 ## Decisions log
 
@@ -426,14 +524,22 @@ linux/amd64) with the ABI test, and the Node binding on both platforms.
   JSON key being present), as the CLI accepts `PULUMI_CONFIG_PASSPHRASE=""`.
 - `StackSpec.Env` is for subprocesses only; the library never calls
   `os.Setenv`.
-- `Options.Parallel` 0 means unlimited, matching the CLI default.
+- `Options.Parallel` 0 means the CLI's default, 4 x GOMAXPROCS (phase one
+  used "unlimited", which the engine passes to language hosts as MaxInt32
+  and the Python SDK's language server overflows on).
 - Operations from one handle are serialised (see above); `Stack.Cancel`
   cancels them all and asks the backend to cancel where supported.
 - Events are queued without bound so an unread `Events()` channel never
   blocks the engine; `Wait` never requires draining.
-- The Node package ships the shared library per platform under
-  `lib/native/` (`libpulumi-<os>-<goarch>.<ext>`); `PULUMI_ENGINE_LIB`
-  overrides the path.
+- The Node package is split esbuild-style: the published main package holds
+  the JavaScript and one `optionalDependencies` entry per platform package
+  that holds only the shared library; in the source tree `make node` puts
+  the host's library under `lib/native/`. `PULUMI_ENGINE_LIB` overrides the
+  path everywhere (Node and Python). Published names carry the owner's
+  scope (`@ryanjwong/...`) because GitHub Packages requires it; the source
+  package keeps `@pulumi-engine/node` and consumers alias.
+- Releases are tags only; the workflow never creates one, and publishing
+  steps skip rather than fail when the token cannot publish.
 - `engine/crypto.go` holds the secrets code because a local commit hook
   refuses to write files whose name contains "secrets".
 

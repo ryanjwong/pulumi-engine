@@ -21,6 +21,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,8 +53,10 @@ const (
 
 // Options tunes one operation. The zero value is a plain operation.
 type Options struct {
-	// Parallel is the maximum number of concurrent resource operations
-	// (0 means unlimited, like the CLI).
+	// Parallel is the maximum number of concurrent resource operations.
+	// 0 selects the CLI's default, 4 x GOMAXPROCS (the value is also what
+	// the language host is told; the Python SDK's language server
+	// multiplies it by four into an int32, so "unlimited" would overflow).
 	Parallel int `json:"parallel,omitempty"`
 	// Message is recorded in the update history on backends that keep one.
 	Message string `json:"message,omitempty"`
@@ -337,7 +340,7 @@ func (o *Operation) execute(ctx context.Context, program Program, opts Options) 
 	}
 	defer host.close()
 
-	parallel := int32(math.MaxInt32)
+	parallel := int32(runtime.GOMAXPROCS(0)) * 4 //nolint:gosec // the CLI's defaultParallel
 	if opts.Parallel > 0 && opts.Parallel < math.MaxInt32 {
 		parallel = int32(opts.Parallel)
 	}

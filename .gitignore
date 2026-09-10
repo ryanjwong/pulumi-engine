@@ -22,3 +22,12 @@ bindings/nodejs/*.tgz
 .idea/
 .vscode/
 .DS_Store
+
+# python
+bindings/python/.venv/
+bindings/python/build/
+bindings/python/dist/
+bindings/python/pulumi_engine/native/libpulumi-*
+*.egg-info/
+__pycache__/
+.pytest_cache/

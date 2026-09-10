@@ -1,0 +1,2 @@
+# Platform shared libraries (libpulumi-<os>-<arch>.<ext>) are placed here when the
+# package is built with a bundled library; see the README.
