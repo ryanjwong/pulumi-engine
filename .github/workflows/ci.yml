@@ -7,6 +7,8 @@ on:
 
 env:
   GO_VERSION: "1.26.4"
+  # The CLI the parity tests run against; keep equal to the pkg/v3 pin in go.mod.
+  PULUMI_CLI_VERSION: "3.237.0"
   PULUMI_SKIP_UPDATE_CHECK: "true"
 
 jobs:
@@ -35,11 +37,15 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
+      - name: install the pulumi CLI (for the parity tests)
+        uses: pulumi/actions@v6
+        with:
+          pulumi-version: ${{ env.PULUMI_CLI_VERSION }}
       - name: cache pulumi plugins
         uses: actions/cache@v4
         with:
           path: ~/.pulumi/plugins
-          key: pulumi-plugins-${{ runner.os }}-${{ hashFiles('engine/integration_test.go') }}
+          key: pulumi-plugins-${{ runner.os }}-${{ hashFiles('engine/integration_test.go', 'engine/parity_test.go') }}
       - run: make integration
 
   lib:
@@ -87,6 +93,10 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: bindings/nodejs/pnpm-lock.yaml
+      - name: install the pulumi CLI (for the parity tests)
+        uses: pulumi/actions@v6
+        with:
+          pulumi-version: ${{ env.PULUMI_CLI_VERSION }}
       - name: cache pulumi plugins
         uses: actions/cache@v4
         with:

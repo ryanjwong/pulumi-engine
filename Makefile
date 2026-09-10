@@ -3,6 +3,7 @@
 #   make build        compile all Go packages
 #   make test         Go unit tests
 #   make integration  Go integration tests (real providers, network; PULUMI_ENGINE_INTEGRATION=1)
+#   make parity       the CLI parity subset of the integration tests (needs the pulumi CLI)
 #   make lib          build libpulumi.{dylib,so} + header for the host platform into build/
 #   make node         install, build and test the Node binding against build/libpulumi.*
 #   make lint         golangci-lint if installed, otherwise go vet
@@ -24,7 +25,7 @@ endif
 LIB      := $(BUILD)/libpulumi.$(LIB_EXT)
 HEADER   := $(BUILD)/libpulumi.h
 
-.PHONY: build test integration lib abitest node node-install node-build lint clean
+.PHONY: build test integration parity lib abitest node node-install node-build lint clean
 
 build:
 	$(GO) build ./...
@@ -34,6 +35,11 @@ test:
 
 integration:
 	PULUMI_ENGINE_INTEGRATION=1 $(GO) test ./engine/... -run 'Integration' -count=1 -v -timeout 30m
+
+# CLI parity subset of the integration tests (needs `pulumi` on PATH or
+# PULUMI_ENGINE_CLI=/path/to/pulumi). See docs/cli-parity.md.
+parity:
+	PULUMI_ENGINE_INTEGRATION=1 $(GO) test ./engine/... -run 'IntegrationParity' -count=1 -v -timeout 30m
 
 lib: $(LIB)
 
@@ -52,6 +58,10 @@ node-install:
 
 node-build: lib node-install
 	mkdir -p bindings/nodejs/lib/native
+	# Remove before copying: overwriting a dylib in place on macOS invalidates
+	# the kernel's cached code signature and every process that then loads
+	# it is killed (SIGKILL) on first call.
+	rm -f bindings/nodejs/lib/native/libpulumi-$(GOOS)-$(GOARCH).$(LIB_EXT)
 	cp $(LIB) bindings/nodejs/lib/native/libpulumi-$(GOOS)-$(GOARCH).$(LIB_EXT)
 	cd bindings/nodejs && pnpm build
 
