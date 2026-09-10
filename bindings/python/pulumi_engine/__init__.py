@@ -60,7 +60,19 @@ from .errors import (
     UnsupportedError,
 )
 
-__version__ = "0.1.0"
+
+def _package_version() -> str:
+    """The installed distribution's version (set from the release tag at
+    packaging time); ``version()`` reports the library's own."""
+    try:
+        from importlib.metadata import version as _dist_version
+
+        return _dist_version("pulumi_engine")
+    except Exception:  # noqa: BLE001 - not installed as a distribution
+        return "0.0.0.dev0"
+
+
+__version__ = _package_version()
 
 __all__ = [
     "CallbackProgram",

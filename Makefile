@@ -124,8 +124,9 @@ dist-node: node-build dist-lib
 
 dist-python: python-install
 	rm -rf $(DIST)/python && mkdir -p $(DIST)/python
-	cd bindings/python && .venv/bin/python -m pip wheel --no-deps -q -w ../../$(DIST)/python . \
-		&& .venv/bin/python -m pip install -q build && .venv/bin/python -m build --sdist -o ../../$(DIST)/python .
+	cd bindings/python && PULUMI_ENGINE_VERSION=$(VERSION) .venv/bin/python -m pip wheel --no-deps -q -w ../../$(DIST)/python . \
+		&& .venv/bin/python -m pip install -q build \
+		&& PULUMI_ENGINE_VERSION=$(VERSION) .venv/bin/python -m build --sdist -o ../../$(DIST)/python .
 
 release-dry-run: dist-lib abitest dist-node dist-python
 	@echo; echo "release artifacts in $(DIST)/ (VERSION=$(VERSION)):"; ls -1 $(DIST) $(DIST)/npm $(DIST)/python | grep -v '^$$'

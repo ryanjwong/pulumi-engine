@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pulumi_engine"
-version = "0.1.0"
+# The version is set by setup.py from PULUMI_ENGINE_VERSION (the release tag).
+dynamic = ["version"]
 description = "Pulumi engine as an in-process library for Python (cffi over libpulumi)."
 readme = "README.md"
 license = { text = "Apache-2.0" }
