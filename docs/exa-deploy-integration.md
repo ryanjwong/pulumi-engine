@@ -95,48 +95,55 @@ unless a loader was installed with `installAutomationRuntimeLoader`. That seam
 
 ## What the library must add
 
-Found by the spike, in order of blocking-ness.
+Found by the spike, in order of blocking-ness. Status after phase two (PR
+"phase 2: per-operation plugin environment, credentials, event metadata, tags,
+listing; upstream compatibility tooling"):
 
-1. **A per-operation plugin environment.** The Go runtime snapshots the
-   process environment when the library loads — on macOS, dyld hands it the
-   environment the process *started* with, so even `process.env` writes made
-   before `koffi.load` are invisible (verified with a probe library) — and
-   Pulumi launches language hosts and providers with `os.Environ()`
-   (`sdk/go/common/resource/plugin/plugin.go`). The CLI's workspace `envVars`
-   (`EXA_DEPLOY_PROGRAM`, `PULUMI_BUILD_TAG`, `NODE_PATH`,
-   `PULUMI_NODEJS_TRANSPILE_ONLY`, per-run credentials) therefore never reach
-   the program; `mkProject` fails on the missing `PULUMI_BUILD_TAG` before
-   registering a resource. The spike bridges this with a preload stub
-   (`--require` added to the manifest's `nodeargs` that loads the env from a
-   file) — the library needs `Options.env` / `StackSpec.env` applied to every
-   plugin it launches, and `PULUMI_HOME` per stack for the plugin cache.
-2. **httpstate credential injection.** `openBackend` stores the token in
-   `~/.pulumi/credentials.json` (`workspace.StoreAccount`) because Pulumi's
-   HTTP backend has no constructor that takes one. Two runs with different
-   tokens for the same backend URL in one process would overwrite each other;
-   the worker vends a token per run. The backend needs a per-stack
-   credential source (a `PULUMI_CREDENTIALS_PATH`-like override per spec, or
-   an `httpstate.New` variant taking an `Account`).
-3. **Accept an empty passphrase.** exa-deploy runs every workspace with
-   `PULUMI_CONFIG_PASSPHRASE=""`; the spec's `validate` treats `""` as unset.
-   Make the field a pointer / `passphraseSet` flag.
-4. **Event sequence and timestamps.** Every event arrives with `sequence:
-   0, timestamp: 0`; the terminal `CancelEvent` is swallowed. The facade
-   numbers events and appends the marker, but the library should emit the
-   CLI's stream (exa-deploy's event log contract and the replay recordings
-   assume it).
-5. **Silence the DIY backend banner.** `pkg/backend/diy/backend.go` prints
-   `Updating (stack):` with `fmt.Printf` to the process's stdout on every
-   operation; in the worker that lands in the pod log, not in the run's
-   stream. Needs a display option or `os.Stdout` redirection in the library.
-6. **Stack history, tags, listing.** `Stack.info/history` (in-memory in the
-   facade), `listTags/setTag` (exa-deploy sets `exa:journal` and `exa:team`
-   on httpstate stacks; best-effort, so it degrades to a warning), and
-   `listStacks` (file:// only in the facade).
+1. **A per-operation plugin environment. Closed.** `StackSpec.Env` (and
+   `Options.Env` per operation) is the environment of every provider plugin
+   and language host the operation launches, overlaid on the process
+   environment and never applied to the process; concurrent operations with
+   different `Env` do not interfere (`TestIntegrationPluginEnvConcurrent`,
+   `TestIntegrationLanguageHostEnv`, the binding's `local.test.ts`). The
+   facade passes the SDK's `envVars` (and `pulumiHome`) through, so
+   `EXA_DEPLOY_PROGRAM`, `PULUMI_BUILD_TAG`, `NODE_PATH`, per-run
+   credentials reach the program with no preload stub. Still process-global:
+   the `PULUMI_HOME` the *library* resolves and downloads plugins from
+   (`workspace.GetPluginPath` reads the process environment; the spec's
+   `PULUMI_HOME` reaches the plugin subprocesses). One `PULUMI_HOME` per
+   worker process is what the pod has today, so this is not blocking;
+   [upstream.md](upstream.md) #9 has the ask.
+2. **httpstate credential injection. Closed for the worker, with a documented
+   hand-off.** The token comes from `backend.token` only (`PULUMI_ACCESS_TOKEN`
+   is never read), each open backend keeps its own, and concurrent opens with
+   different tokens for one URL each get theirs (`TestHTTPBackendCredentialsPerSpec`,
+   httptest, asserts the `Authorization` header per stack). Pulumi's backend
+   has no in-memory constructor, so the token is handed over through the
+   credentials file under a lock for the duration of the constructor and the
+   file is restored byte for byte; the file lives at the process's
+   `PULUMI_HOME` ([upstream.md](upstream.md) #3).
+3. **Accept an empty passphrase. Closed.** `PULUMI_CONFIG_PASSPHRASE=""` is
+   passed through as `passphrase: ""`; the presence of the JSON key is the
+   confirmation (`PassphraseSet` in Go).
+4. **Event sequence and timestamps. Closed.** Every event carries `sequence`
+   (from 0) and `timestamp`; the stream ends with the engine's `cancel`
+   event after the summary, as `pulumi --event-log` does. The facade forwards
+   the library's events unchanged; the event-log contract and the replay
+   recordings hold with no facade numbering.
+5. **Silence the DIY backend banner. Closed.** The banner is captured from
+   the Go runtime's stdout and delivered as a `stdout` event of the operation
+   (the facade prints its own header and skips the duplicate); nothing from
+   the library reaches the pod's stdout.
+6. **Stack history, tags, listing. Closed.** `Stack.GetTags/SetTags`,
+   `Stack.History`, `engine.ListStacks` over both backends (DIY tags are a
+   `<stack>.pulumi-tags` file that the CLI reads; DIY history has no version
+   numbers; `Organization` filters are `Unsupported` on DIY). The facade's
+   `listTags/setTag/getTag/removeTag`, `history/info` and `listStacks` use
+   them, so `ensureStackTags` sets `exa:journal`/`exa:team` for real.
 7. **Update plans** (`preview --save-plan` / `up --plan`, used by the
    plan-bound `up`) and `PulumiCommand.run` replacements for the paths that
    still spawn `pulumi` (`stack export --show-secrets` streaming in
-   `stack-export.ts`, state mirrors).
+   `stack-export.ts`, state mirrors). **Open.**
 
 ## exa-deploy assumptions that presume a `pulumi` binary
 
@@ -150,10 +157,10 @@ CLI (none of these blocked a file-backend preview/up):
 | `stack-export.ts` `exportStackWithoutBuffer` | spawns `pulumi stack export --show-secrets` (bootstrap-from-backend and mirrors) | not reached on a file backend; would fail with ENOENT |
 | `state-mirror.ts` | `automationCommand` + `pulumiCommand` for mirror imports | not reached (no mirror target for `file://`) |
 | `lock-poll.ts` | spawns `aws s3api` (not pulumi) | skipped for non-S3 backends |
-| `automation-workspace.ts` `workspaceEnvVars` | `PULUMI_CONFIG_PASSPHRASE: ""`, `NODE_PATH`, `EXA_DEPLOY_PROGRAM` reach the engine child | passphrase substituted; env delivered by the preload stub |
-| `temp-workspace.ts` `generatePulumiYaml` | `runtime.options.nodeargs` honoured by the language host | honoured (the stub prepends to it) |
-| `automation.ts` `ensureStackTags` | `listTags/setTag` on httpstate stacks | facade rejects; the CLI catches and warns |
-| worker `deploy-stage.ts` | `SHIP_PULUMI_HOME` per pod via env | must become a library option (item 1) |
+| `automation-workspace.ts` `workspaceEnvVars` | `PULUMI_CONFIG_PASSPHRASE: ""`, `NODE_PATH`, `EXA_DEPLOY_PROGRAM` reach the engine child | phase two: `envVars` become `StackSpec.env` for the language host and providers; the empty passphrase is accepted |
+| `temp-workspace.ts` `generatePulumiYaml` | `runtime.options.nodeargs` honoured by the language host | honoured |
+| `automation.ts` `ensureStackTags` | `listTags/setTag` on httpstate stacks | phase two: served by `Stack.GetTags/SetTags` on both backends |
+| worker `deploy-stage.ts` | `SHIP_PULUMI_HOME` per pod via env | phase two: `envVars.PULUMI_HOME` reaches the plugins; the library's own plugin cache is the process's `PULUMI_HOME` (one per pod today) |
 
 ## Measured: one stage, Automation API versus the library
 
